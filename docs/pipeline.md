@@ -1,83 +1,212 @@
-A. Final pipeline (end‑to‑end)
+# High-level design for Functional Grasp Training Pipeline
 
-Goal: predict a functional dexterous hand grasp pose conditioned on semantics (image+language) and geometry (object point cloud).
+## A. Overview
 
-(Image(s), Text) ──► Qwen2.5‑VL (frozen) ──► s ∈ ℝ^{B×Csem}
-Point cloud P ∈ ℝ^{B×N×d} ─► PointNet++ ─► F_geo ∈ ℝ^{B×N×Cgeo}
+**Goal**: Predict functional dexterous hand grasp poses conditioned on semantics (image+language) and object geometry (point cloud).
 
-Broadcast & Concat: [F_geo ; tile(s,N)] ─► 1D Fusion Transformer (across points)
-  └─► F_fuse ∈ ℝ^{B×N×Cfuse}
+> **Visual Reference**: See hand-drawn architecture sketches in `assets/`:
+> - `overall.png` - Overall system architecture
+> - `fusion.png` - Fusion mechanism details
 
-Per‑point contact head:
-  F_fuse ─► logits_c ∈ ℝ^{B×N×1} ─► p_contact ∈ [0,1]
+### Architecture Flow
+```
+(Image, Text) ──► Qwen2.5-VL ──► s ∈ ℝ^{B×256}               [Semantic features]
+     ↓
+Point Cloud ────► PointNet++ ──► F_geo ∈ ℝ^{B×N×256}        [Geometric features]
+     ↓
+Fusion Transformer ──► F_fuse ∈ ℝ^{B×N×(CSEM+CGEO)}         [Per-point fused]
+     ↓
+Contact Head ──► p_contact ∈ [0,1]^{B×N}                    [Contact map]
+     ↓                 
+Mean Pooling ──► z ∈ ℝ^{B×(CSEM+CGEO)}                      [Global fused]
+     ↓
+Flow Matching ──► pose ∈ ℝ^{B×28}                           [Grasp pose]
+```
 
-Contact‑weighted pooling:
-  z = Σ_i softmax(p_contact)_i · F_fuse_i ∈ ℝ^{B×Cfuse}
-  c = MLP([z; s; g]) ∈ ℝ^{B×Ccond}     (g = global geometry pool)
+### Key Dimensions
+- B: Batch size (2-4 for CPU, 8-32 for GPU)
+- N: Points per object (1024)
+- Feature dimensions: CSEM=256, CGEO=256, CFUSE=CSEM+CGEO=512, CCOND=CFUSE
+- Pose dimension: DPOSE=28 (3 wrist + 25 joint params)
 
-Conditional Flow Matching (rectified flow):
-  Train vector field vθ(x_t,t,c) to transport N(0,I) → grasp pose y
-  Inference: integrate dx/dt = vθ(x,t,c) from t=0→1 → pose ŷ ∈ ℝ^{B×Dpose}
+## B. Training Implementation (Core Focus)
 
+### B.1 Main Training Loop
 
-Canonical shapes.
-B batch; N points (e.g., 1024);
-Csem from Qwen (projected); Cgeo from PointNet++; Cfuse fusion width; Ccond conditioning width; Dpose wrist + joints (e.g., 26–30 DOF).
+```python
+# grasp/train.py - Core training logic
+import torch
+import torch.nn.functional as F
+from torch.optim import AdamW
+from data.oakink_loader import create_oakink_loaders
+from models.functional_grasp_model import FunctionalGraspModel
 
-B. Why Qwen2.5‑VL works well here (and how we use it)
+def train_functional_grasp(cfg):
+    # Initialize model
+    model = FunctionalGraspModel(
+        qwen_name="Qwen/Qwen2.5-VL-3B-Instruct",
+        CSEM=256, CGEO=256, DPOSE=28
+    )
+    
+    # Data loaders with OakInk
+    train_loader, val_loader = create_oakink_loaders(
+        root_dir=cfg['data_path'],
+        batch_size=cfg['batch_size'],  # 2-4 for CPU, 8-16 for GPU
+        n_points=1024,
+        contact_threshold=0.01  # 1cm for contact approximation
+    )
+    
+    # Optimizer (only non-frozen params)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = AdamW(trainable_params, lr=1e-4, weight_decay=0.05)
+    
+    for epoch in range(cfg['epochs']):
+        for batch in train_loader:
+            # Forward pass
+            out = model.forward_train(
+                images=batch['images'],
+                texts=batch['texts'],  # From semantic attributes
+                pts=batch['points'],
+                y_pose=batch['pose']
+            )
+            
+            # Loss computation
+            loss_contact = F.binary_cross_entropy_with_logits(
+                out['logits_c'].squeeze(-1), 
+                batch['contact_labels']
+            )
+            
+            loss_flow = compute_flow_matching_loss(
+                model, out['cond'], batch['pose']
+            )
+            
+            loss = cfg['lambda_c'] * loss_contact + cfg['lambda_fm'] * loss_flow
+            
+            # Backward
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            optimizer.step()
+```
 
-HF Transformers includes first‑class support for Qwen2.5‑VL via Qwen2_5_VLForConditionalGeneration / Qwen2_5_VLModel and AutoProcessor; use the chat template + processor to pack images+text. It also exposes min_pixels/max_pixels to control image tokenization cost. 
-Hugging Face
+### B.2 Flow Matching Loss
 
-The model card provides a reference quickstart and notes to install a recent Transformers (otherwise you may hit the KeyError: 'qwen2_5_vl'). It also shows the recommended helper qwen-vl-utils to assemble images/videos payloads. 
-Hugging Face
+```python
+def compute_flow_matching_loss(model, conditioning, target_pose):
+    """Rectified flow matching for pose generation"""
+    B = target_pose.size(0)
+    
+    # Sample noise and time
+    x0 = torch.randn_like(target_pose)  # Start: Gaussian noise
+    t = torch.rand(B, device=target_pose.device)  # Time: U[0,1]
+    
+    # Interpolate between noise and target
+    x_t = (1 - t.unsqueeze(-1)) * x0 + t.unsqueeze(-1) * target_pose
+    
+    # Predict velocity field
+    v_pred = model.flow_step(x_t, t, conditioning)
+    
+    # Target velocity (constant for rectified flow)
+    v_target = target_pose - x0
+    
+    return F.mse_loss(v_pred, v_target)
+```
 
-Config exposes image_token_id and other internals; we’ll simply mean‑pool the final hidden states under the attention mask to obtain a robust global semantic embedding s without modifying Qwen. 
-Hugging Face
+### B.3 CPU Development Strategy
 
-C. Dependencies & environment
-# Core
-pip install -U "torch>=2.3" torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install -U "transformers>=4.51" accelerate
-pip install qwen-vl-utils[decord]==0.0.8   # helper for images/videos packing (optional but convenient)
-# Geometry
-pip install open3d pytorch3d  # or torch-geometric; choose your preference
-# (Optional) quantization / speedups
-pip install torchao  # weight-only quantization if ever needed
+```python
+# Configuration for CPU development
+CPU_CONFIG = {
+    'batch_size': 2,  # Small batch for CPU
+    'num_workers': 0,  # Avoid multiprocessing issues
+    'n_points': 512,   # Reduce points if needed
+    'use_fp16': False, # Stay in FP32 for CPU
+    'gradient_accumulation': 4,  # Simulate larger batches
+    'checkpoint_freq': 100  # Frequent saves
+}
 
+# Memory-efficient training step
+def train_step_cpu(model, batch, optimizer, grad_accum_steps=4):
+    # Accumulate gradients over mini-batches
+    for i in range(grad_accum_steps):
+        mini_batch = get_mini_batch(batch, i, grad_accum_steps)
+        loss = compute_loss(model, mini_batch)
+        loss = loss / grad_accum_steps
+        loss.backward()
+    
+    optimizer.step()
+    optimizer.zero_grad()
+```
 
-Qwen2.5‑VL support landed in recent transformers; upgrading avoids the qwen2_5_vl KeyError mentioned in the model card. 
-Hugging Face
+## C. Environment Setup
 
-D. Implementation skeleton (modular PyTorch)
+### Already Installed Dependencies
+```bash
+# Core (in conda env 'grasp')
+- torch, torchvision (CPU or CUDA)
+- transformers>=4.51 (Qwen2.5-VL support)
+- qwen-vl-utils==0.0.8
+- trimesh (for mesh loading)
 
-Folders
+# Additional requirements
+pip install wandb  # For experiment tracking
+pip install einops # For tensor operations
+```
 
-grasp/
-  models/
-    semantics_qwen.py
-    pointnet2_encoder.py
-    fusion_transformer.py
-    contact_head.py
-    flow_matching.py
-    functional_grasp_model.py
-  train.py
-  utils.py
-  cfg.py
+### Verify Installation
+```python
+# test.py - Already confirmed working
+from transformers import Qwen2_5_VLForConditionalGeneration
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    "Qwen/Qwen2.5-VL-3B-Instruct"
+)
+print(model)  # Should show full architecture
+```
 
-D1) Qwen2.5‑VL semantics encoder (frozen features)
+## D. Project Structure
+
+```
+FuncGrasp/
+├── data/
+│   ├── oakink_loader.py      ✓ Complete - OakInk dataset loader
+│   └── prepare_oakink.py     ✓ Complete - Testing utilities
+├── grasp/
+│   ├── models/
+│   │   ├── semantics_qwen.py     # Qwen2.5-VL wrapper
+│   │   ├── pointnet2_encoder.py  # Point cloud encoder
+│   │   ├── fusion_transformer.py # Multi-modal fusion
+│   │   ├── contact_head.py       # Contact prediction
+│   │   ├── flow_matching.py      # Pose generation
+│   │   └── functional_grasp_model.py # Full model
+│   ├── train.py              # Main training script
+│   ├── evaluate.py           # Evaluation metrics
+│   └── config.py             # Configuration
+├── docs/
+│   ├── pipeline.md           ✓ This document
+│   └── dataset.md            ✓ Complete - Dataset documentation
+└── scripts/
+    └── train_oakink.sh       # Training launch script
+```
+
+## E. Model Architecture Components
+
+### E.1 Qwen2.5-VL Semantics Encoder (Frozen)
+
+```python
 # grasp/models/semantics_qwen.py
 import torch, torch.nn as nn
 from transformers import AutoProcessor, Qwen2_5_VLModel
-from qwen_vl_utils import process_vision_info  # from qwen-vl-utils
+from qwen_vl_utils import process_vision_info
 
 class QwenSemanticsEncoder(nn.Module):
     """
-    Wraps Qwen2.5-VL to produce a pooled multimodal embedding s ∈ ℝ^{B×Csem_proj}.
-    Default: freeze Qwen and learn only a projection.
+    Wraps Qwen2.5-VL to produce a pooled multimodal embedding s ∈ ℝ^{B×CSEM}.
+    Backbone can be frozen or fine-tuned based on freeze_backbone parameter.
     """
     def __init__(self, model_name="Qwen/Qwen2.5-VL-3B-Instruct",
-                 csem_proj=256, min_pixels=None, max_pixels=None, device_map="auto", dtype=torch.bfloat16):
+                 csem_proj=256, freeze_backbone=True,
+                 min_pixels=None, max_pixels=None, 
+                 device_map="auto", dtype=torch.bfloat16):
         super().__init__()
         self.processor = AutoProcessor.from_pretrained(
             model_name, min_pixels=min_pixels, max_pixels=max_pixels
@@ -86,25 +215,27 @@ class QwenSemanticsEncoder(nn.Module):
         self.backbone = Qwen2_5_VLModel.from_pretrained(
             model_name, torch_dtype=dtype, device_map=device_map
         )
-        for p in self.backbone.parameters():
-            p.requires_grad_(False)
+        # Optionally freeze Qwen parameters
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad_(False)
+        else:
+            # Enable gradient checkpointing for memory efficiency
+            self.backbone.gradient_checkpointing_enable()
         hidden = self.backbone.config.hidden_size
         self.proj = nn.Sequential(
             nn.LayerNorm(hidden),
             nn.Linear(hidden, csem_proj)
         )
 
-    @torch.inference_mode()
     def _pack(self, images, texts):
-        # images: list of PIL.Image or paths; texts: list[str], length B
-        messages = [{"role": "user",
-                     "content": [{"type": "image", "image": im},
-                                 {"type": "text",  "text": txt}]}]
-        # one-message-per-sample batching
-        messages = [{"role":"user","content":[{"type":"image","image":im},{"type":"text","text":tx}]} 
-                    for im,tx in zip(images, texts)]
-        text_inputs = [self.processor.apply_chat_template(m, tokenize=False, add_generation_prompt=False)
-                       for m in messages]
+        # images: list of PIL.Image; texts: list[str]
+        messages = [{"role":"user","content":[
+            {"type":"image","image":im},
+            {"type":"text","text":tx}]} 
+            for im,tx in zip(images, texts)]
+        text_inputs = [self.processor.apply_chat_template(m, tokenize=False, 
+                       add_generation_prompt=False) for m in messages]
         image_inputs, video_inputs = zip(*[process_vision_info(m) for m in messages])
         proc = self.processor(
             text=text_inputs, images=list(image_inputs), videos=list(video_inputs),
@@ -113,31 +244,24 @@ class QwenSemanticsEncoder(nn.Module):
         return proc
 
     def forward(self, images, texts):
-        """
-        images: List[image]; texts: List[str]; returns s [B, Csem_proj]
-        """
+        """images: List[image]; texts: List[str]; returns s [B, Csem_proj]"""
         inputs = self._pack(images, texts).to(next(self.proj.parameters()).device)
         out = self.backbone(**inputs, output_hidden_states=False, return_dict=True)
-        # masked mean pool over tokens (text+vision) → global multimodal vector
-        mask = inputs.attention_mask.float().unsqueeze(-1)  # [B, L, 1]
-        pooled = (out.last_hidden_state * mask).sum(dim=1) / (mask.sum(dim=1).clamp_min(1e-6))
-        s = self.proj(pooled)  # [B, Csem_proj]
+        # Masked mean pool over tokens → s ∈ ℝ^{B×CSEM}
+        mask = inputs.attention_mask.float().unsqueeze(-1)
+        pooled = (out.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1e-6)
+        s = self.proj(pooled)
         return s
+```
 
+### E.2 PointNet++ Encoder
 
-Notes: AutoProcessor + chat template and the min_pixels/max_pixels knobs are the officially supported way to control visual token counts. 
-Hugging Face
-+1
-
-D2) PointNet++ encoder (per‑point features)
-
-You can plug your favorite implementation. Below is a light, dependency‑free PointNet++‑like fallback (FPS + kNN groups with shared MLPs). Replace with your high‑performance version when ready.
-
+```python
 # grasp/models/pointnet2_encoder.py
-import torch, torch.nn as nn, torch.nn.functional as F
+import torch, torch.nn as nn
 
 def fps(x, M):
-    # x: [B,N,3] → indices [B,M]
+    # Farthest point sampling: x[B,N,3] → indices[B,M]
     B, N, _ = x.shape
     centroids = torch.zeros(B, M, dtype=torch.long, device=x.device)
     dist = torch.full((B, N), 1e10, device=x.device)
@@ -145,46 +269,455 @@ def fps(x, M):
     batch = torch.arange(B, device=x.device)
     for i in range(M):
         centroids[:, i] = farthest
-        centroid = x[batch, farthest].unsqueeze(1)  # [B,1,3]
-        d = ((x - centroid)**2).sum(-1)             # [B,N]
+        centroid = x[batch, farthest].unsqueeze(1)
+        d = ((x - centroid)**2).sum(-1)
         dist = torch.minimum(dist, d)
         farthest = torch.max(dist, dim=1).indices
     return centroids
 
-class SharedMLP(nn.Sequential):
-    def __init__(self, in_c, out_c):
-        super().__init__(nn.Linear(in_c, out_c), nn.ReLU(), nn.Linear(out_c, out_c), nn.ReLU())
-
 class PointNet2Encoder(nn.Module):
-    """
-    Minimal PointNet++-style encoder.
-    Outputs: per-point F_geo [B,N,Cgeo] and global g [B,Cgeo].
-    """
-    def __init__(self, in_c=3, cgeo=256, hidden=128, groups=32, samples=512):
+    """Minimal PointNet++-style encoder."""
+    def __init__(self, in_c=3, cgeo=256, hidden=128, samples=512):
         super().__init__()
-        self.groups, self.samples = groups, samples
-        self.mlp1 = SharedMLP(in_c, hidden)
-        self.mlp2 = SharedMLP(hidden, cgeo)
+        self.samples = samples
+        self.mlp1 = nn.Sequential(
+            nn.Linear(in_c, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU()
+        )
+        self.mlp2 = nn.Sequential(
+            nn.Linear(hidden, cgeo), nn.ReLU(),
+            nn.Linear(cgeo, cgeo), nn.ReLU()
+        )
 
     def forward(self, pts):
-        # pts: [B,N,3] (optionally append normals/RGB)
-        x = self.mlp1(pts)                    # [B,N,H]
+        # pts: [B,N,3]
+        x = self.mlp1(pts)
         B, N, _ = x.shape
-        # very light grouping (FPS + local mean), keeps everything differentiable
-        idx = fps(pts[..., :3], min(self.samples, N))       # [B,S]
-        anchors = x.gather(1, idx.unsqueeze(-1).expand(-1,-1,x.size(-1)))  # [B,S,H]
-        # project anchors back to all points by nearest-anchor assignment
-        dists = torch.cdist(pts[..., :3], pts[torch.arange(B)[:,None], idx][..., :3]) # [B,N,S]
+        
+        # Light grouping via FPS
+        idx = fps(pts[..., :3], min(self.samples, N))
+        anchors = x.gather(1, idx.unsqueeze(-1).expand(-1,-1,x.size(-1)))
+        
+        # Project back to all points
+        dists = torch.cdist(pts[..., :3], pts[torch.arange(B)[:,None], idx][..., :3])
         w = torch.softmax(-dists, dim=-1)
-        x = (w @ anchors)                     # [B,N,H]
-        F_geo = self.mlp2(x)                  # [B,N,Cgeo]
-        g = F_geo.mean(dim=1)                 # [B,Cgeo]
+        x = w @ anchors
+        
+        F_geo = self.mlp2(x)
+        g = F_geo.mean(dim=1)
         return F_geo, g
+```
 
-D3) Fusion transformer & contact head
+### E.3 Fusion Transformer & Contact Head
+
+```python
 # grasp/models/fusion_transformer.py
 import torch, torch.nn as nn
 
+class FusionTransformer1D(nn.Module):
+    def __init__(self, c_geo, c_sem, depth=4, heads=8):
+        super().__init__()
+        c_fuse = c_geo + c_sem
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=c_fuse, nhead=heads, dim_feedforward=4*c_fuse,
+            batch_first=True, norm_first=True
+        )
+        self.enc = nn.TransformerEncoder(enc_layer, num_layers=depth)
+        
+    def forward(self, f_geo, s):
+        # f_geo: [B,N,Cgeo], s: [B,Csem]
+        B, N, _ = f_geo.shape
+        s_tile = s.unsqueeze(1).expand(B, N, -1)
+        x = torch.cat([f_geo, s_tile], -1)  # [B,N,Cgeo+Csem]
+        return self.enc(x)
+
+# grasp/models/contact_head.py
+class ContactHead(nn.Module):
+    def __init__(self, c_fuse, k=1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(c_fuse, c_fuse//2), nn.ReLU(),
+            nn.Linear(c_fuse//2, k)
+        )
+    def forward(self, f_fuse):
+        return self.net(f_fuse)
+```
+
+### E.4 Conditional Flow Matching
+
+```python
+# grasp/models/flow_matching.py
+import torch, torch.nn as nn, math
+
+class PositionalEncoding1D(nn.Module):
+    def __init__(self, d=64, maxw=10000.0):
+        super().__init__()
+        self.d = d
+        self.maxw = maxw
+        
+    def forward(self, t):
+        # t: [B,1] in [0,1]
+        device = t.device
+        d = self.d // 2
+        freqs = torch.exp(torch.arange(d, device=device) * 
+                         (-math.log(self.maxw)/max(d-1,1)))
+        ang = 2*math.pi * t * freqs
+        return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
+
+class PoseFlow(nn.Module):
+    def __init__(self, d_pose, c_cond, hidden=1024):
+        super().__init__()
+        self.t_embed = nn.Sequential(
+            PositionalEncoding1D(64), 
+            nn.Linear(64, 128), 
+            nn.SiLU()
+        )
+        self.net = nn.Sequential(
+            nn.Linear(d_pose + 128 + c_cond, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, d_pose)
+        )
+        
+    def forward(self, x_t, t, c):
+        te = self.t_embed(t.unsqueeze(-1))
+        return self.net(torch.cat([x_t, te, c], -1))
+```
+
+### E.5 Full Model Integration
+
+```python
+# grasp/models/functional_grasp_model.py
+import torch, torch.nn as nn
+from .semantics_qwen import QwenSemanticsEncoder
+from .pointnet2_encoder import PointNet2Encoder
+from .fusion_transformer import FusionTransformer1D
+from .contact_head import ContactHead
+from .flow_matching import PoseFlow
+
+class FunctionalGraspModel(nn.Module):
+    def __init__(self, qwen_name="Qwen/Qwen2.5-VL-3B-Instruct",
+                 CSEM=256, CGEO=256, DPOSE=28, K_CONTACT=1):
+        super().__init__()
+        self.sem = QwenSemanticsEncoder(model_name=qwen_name, csem_proj=CSEM)
+        self.pc = PointNet2Encoder(in_c=3, cgeo=CGEO)
+        CFUSE = CSEM + CGEO
+        self.fuse = FusionTransformer1D(c_geo=CGEO, c_sem=CSEM, c_fuse=CFUSE)
+        self.cm = ContactHead(CFUSE, k=K_CONTACT)
+        self.flow = PoseFlow(d_pose=DPOSE, c_cond=CFUSE)
+
+    def forward_backbone(self, images, texts, pts):
+        s = self.sem(images, texts)             # [B,CSEM]
+        f_geo, _ = self.pc(pts)                 # [B,N,CGEO]
+        f_fuse = self.fuse(f_geo, s)            # [B,N,CFUSE=CSEM+CGEO]
+        logits_c = self.cm(f_fuse)              # [B,N,1]
+        # Simple mean pooling as in sketch
+        z = f_fuse.mean(dim=1)                  # [B,CFUSE]
+        c = z                                   # Conditioning is pooled fused
+        return f_fuse, logits_c, c
+
+    def forward_train(self, images, texts, pts):
+        f_fuse, logits_c, c = self.forward_backbone(images, texts, pts)
+        return dict(f_fuse=f_fuse, logits_c=logits_c, cond=c)
+
+    def flow_step(self, x_t, t, c):
+        return self.flow(x_t, t, c)
+```
+
+## F. Training Configuration
+
+### F.1 Hyperparameters
+
+```python
+# grasp/config.py
+CONFIG = {
+    # Model architecture
+    'model': {
+        'qwen_name': 'Qwen/Qwen2.5-VL-3B-Instruct',
+        'freeze_qwen': True,  # Set False to fine-tune backbone
+        'CSEM': 256,
+        'CGEO': 256, 
+        'DPOSE': 28,
+        'n_points': 1024
+    },
+    
+    # Training
+    'training': {
+        'batch_size': 4 if torch.cuda.is_available() else 2,
+        'learning_rate': 1e-4,  # For new layers
+        'backbone_lr': 1e-5,    # For Qwen backbone (if unfrozen)
+        'weight_decay': 0.05,
+        'epochs': 100,
+        'gradient_clip': 1.0,
+        'lambda_contact': 1.0,
+        'lambda_flow': 1.0
+    },
+    
+    # Data
+    'data': {
+        'root_dir': '/path/to/OakInk',
+        'split_mode': 'split0',  # Object-based split
+        'contact_threshold': 0.01,  # 1cm
+        'use_cache': True
+    },
+    
+    # CPU/GPU settings
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    'num_workers': 4 if torch.cuda.is_available() else 0,
+    'fp16': torch.cuda.is_available()  # Only on GPU
+}
+```
+
+### F.2 Inference Pipeline
+
+```python
+def inference(model, image, text, point_cloud, device='cpu'):
+    """Generate grasp pose from inputs"""
+    model.eval()
+    with torch.no_grad():
+        # Get conditioning
+        _, _, conditioning = model.forward_backbone(
+            images=[image],
+            texts=[text],
+            pts=point_cloud.unsqueeze(0)
+        )
+        
+        # Sample poses via flow matching
+        x = torch.randn(1, 28, device=device)  # Start from noise
+        
+        # Integrate ODE
+        steps = 20
+        for k in range(steps):
+            t = torch.tensor([(k + 0.5) / steps], device=device)
+            v = model.flow_step(x, t, conditioning)
+            x = x + (1.0 / steps) * v
+        
+        return x  # Final pose
+```
+
+## G. Data Interface
+
+```python
+# Each batch should provide:
+batch = {
+  "images": [PIL.Image.Image, ...],     # length B
+  "texts":  [str, ...],                 # length B, from semantic attributes
+  "points": torch.Tensor[B,N,3],        # object point cloud
+  "contact_labels": torch.Tensor[B,N],  # approximated from proximity
+  "pose": torch.Tensor[B,Dpose],        # hand pose (28D)
+}
+```
+
+## H. Quick Start Guide
+
+### H.1 Start Training
+
+```bash
+# 1. Activate environment
+conda activate grasp
+
+# 2. Test data loading
+python data/prepare_oakink.py --test_loading
+
+# 3. Start training (CPU mode)
+python grasp/train.py \
+    --data_path /path/to/OakInk \
+    --batch_size 2 \
+    --device cpu \
+    --checkpoint_dir ./checkpoints
+
+# 4. Monitor with tensorboard
+tensorboard --logdir ./logs
+```
+
+### H.2 Development Tips
+
+1. **CPU Development**:
+   - Use batch_size=1-2 for testing
+   - Test with subset of data first
+   - Use gradient accumulation for effective larger batches
+
+2. **Debugging**:
+   ```python
+   # Add shape checks
+   def debug_forward(model, batch):
+       print(f"Images: {len(batch['images'])}")
+       print(f"Points: {batch['points'].shape}")
+       print(f"Contact labels: {batch['contact_labels'].shape}")
+       print(f"Pose: {batch['pose'].shape}")
+       
+       out = model.forward_train(**batch)
+       for k, v in out.items():
+           print(f"{k}: {v.shape if hasattr(v, 'shape') else type(v)}")
+   ```
+
+3. **Memory Management**:
+   - Clear cache regularly: `torch.cuda.empty_cache()`
+   - Use checkpoint gradients for large models
+   - Consider model quantization for inference
+
+## I. Evaluation & Metrics
+
+### I.1 Evaluation Metrics
+
+```python
+def evaluate_grasp(pred_pose, gt_pose, point_cloud, contact_labels):
+    """Compute evaluation metrics"""
+    metrics = {}
+    
+    # Pose accuracy (joint angles)
+    metrics['pose_error'] = F.mse_loss(pred_pose, gt_pose).item()
+    
+    # Contact prediction accuracy
+    pred_contacts = model.predict_contacts(pred_pose, point_cloud)
+    metrics['contact_iou'] = compute_iou(pred_contacts, contact_labels)
+    
+    # Functional success (task-specific)
+    metrics['grasp_stability'] = check_force_closure(pred_pose, point_cloud)
+    
+    return metrics
+```
+
+### I.2 Post-processing
+
+- Generate M=4 poses per object
+- Score by: contact coverage + penetration penalty + joint limits
+- Select best pose for execution
+
+## J. Ablation Studies
+
+1. **Fusion Transformer**: Replace with MLP → test multi-modal fusion importance
+2. **Contact weighting**: Use average pooling → test contact prediction value
+3. **Visual input**: Text-only vs Image+Text → quantify visual contribution
+4. **Flow steps**: Vary integration steps (10, 20, 50) → speed vs quality
+
+## K. Implementation Checklist
+
+- [ ] Coordinate frames consistent (world/camera/object)
+- [ ] Contact probabilities normalized (softmax/sigmoid)
+- [ ] Joint limits enforced after generation
+- [ ] Time sampling t ~ U[0,1] for flow matching
+- [ ] Gradient clipping enabled (prevent instability)
+- [ ] Qwen backbone frozen (only projection trainable)
+- [ ] Data augmentation applied consistently
+- [ ] Checkpoint saving every N iterations
+
+## L. Testing & Validation
+
+```python
+from grasp.models.functional_grasp_model import FunctionalGraspModel
+from PIL import Image
+
+# Quick smoke test
+model = FunctionalGraspModel(DPOSE=28)
+dummy_images = [Image.open("example.jpg")] * 2
+dummy_texts = ["grasp the bottle to pour water"] * 2
+dummy_pts = torch.randn(2, 1024, 3)
+
+out = model.forward_backbone(dummy_images, dummy_texts, dummy_pts)
+for k,v in zip(["F_fuse","logits_c","cond"], out):
+    print(k, v.shape)
+# Expected: [B,N,Cfuse], [B,N,1], [B,Ccond]
+```
+
+## L. Alignment with Original Architecture Sketches
+
+The implementation follows the hand-drawn architecture sketches in `assets/`:
+
+### Sketch-to-Code Mapping
+
+| Sketch Notation | Implementation | Description |
+|----------------|----------------|-------------|
+| LLM (red path) | Qwen2.5-VL | Vision-language model for semantics |
+| F_sem (1×C_L) | s ∈ ℝ^{B×256} | Global semantic features |
+| F_geo (1024×C_i) | F_geo ∈ ℝ^{B×1024×256} | Per-point geometric features |
+| pts | Point cloud input | 3D object points |
+| Fusion | FusionTransformer1D | Concatenate & transform features |
+| Contact map | ContactHead | Binary contact prediction |
+| Pooling | Mean or weighted pooling | Aggregate to global features |
+| FM (Flow Matching) | PoseFlow | Generate grasp poses |
+
+### Design Decisions
+
+1. **Baseline uses mean pooling**: The sketches suggest contact-weighted pooling (pooling after contact), which is implemented as option M.1
+2. **Semantic broadcast**: We tile semantic features to all points before fusion, as shown in sketch 2
+3. **Dimension alignment**: C_i=256 (CGEO), C_L=256 (CSEM), fusion produces 512D features
+
+## M. Optional Design Variants (Advanced)
+
+> These are drop-in alternatives you can enable later without changing the baseline in this doc. They reflect designs we discussed as potentially better under some settings.
+
+### M.0 Fine-tuning Qwen2.5-VL Backbone
+
+- **What**: Allow gradients to flow through the Qwen backbone instead of freezing it.
+- **Why**: Adapt vision-language representations to your specific grasp domain; can improve task performance.
+- **How**:
+```python
+# In config.py
+MODEL = {
+    'freeze_qwen': False,  # Enable gradient flow
+}
+TRAINING = {
+    'backbone_lr': 1e-5,   # Lower LR for pretrained weights
+    'learning_rate': 1e-4, # Higher LR for new layers
+    'batch_size': 1,       # Reduce for memory
+    'gradient_accumulation': 8,
+}
+```
+- **Impact**:
+  - Trainable params: 15.4M → 3.77B
+  - Memory: ~0.2GB → ~42GB
+  - Requires 24GB+ GPU (A100, A6000, etc.)
+- **Tips**:
+  - Use gradient checkpointing (automatic when unfrozen)
+  - Mixed precision (fp16/bf16) essential
+  - Monitor for catastrophic forgetting
+
+### M.1 Contact‑weighted pooling (focus on graspable regions)
+
+- **What**: Use predicted contact to weight which points contribute to the global descriptor instead of plain mean pooling.
+- **Why**: Emphasizes likely contact areas; can improve sample efficiency and pose quality once contact logits become reliable.
+- **How**:
+```python
+# Replace baseline pooling in FunctionalGraspModel.forward_backbone
+logits_c = self.cm(f_fuse)               # [B,N,1]
+p = torch.sigmoid(logits_c)              # [B,N,1]
+w = p / (p.sum(dim=1, keepdim=True) + 1e-6)
+z_weighted = (w * f_fuse).sum(dim=1)     # [B, CFUSE]
+c = z_weighted                           # Conditioning
+```
+- **Stability tips**:
+  - **Warm‑up mix**: start with mean pooling and blend into weighted pooling
+    ```python
+    z_mean = f_fuse.mean(dim=1)
+    alpha = max(0.0, 1.0 - step / warmup_steps)  # step from your trainer
+    z = alpha * z_mean + (1 - alpha) * z_weighted
+    ```
+  - **Temperature** (softmax form): `w = softmax(logits_c / tau, dim=1)` and anneal `tau` ↓.
+  - **Entropy reg** (optional): add `beta * (w * (w.clamp_min(1e-8).log())).sum(1).mean()` to the loss.
+
+### M.2 Global geometry skip path (coarse shape context)
+
+- **What**: Feed a global summary of the geometry branch directly to the conditioner alongside the fused features; this “skips” the fusion block.
+- **Why**: Preserves coarse object cues (size, symmetry) even if fusion or pooling under‑represents them; often stabilizes early training.
+- **How**:
+```python
+# In FunctionalGraspModel.__init__
+CFUSE = CSEM + CGEO
+self.flow = PoseFlow(d_pose=DPOSE, c_cond=CFUSE + CSEM + CGEO)
+
+# In forward_backbone
+f_geo, g = self.pc(pts)                  # g: [B, CGEO]
+f_fuse = self.fuse(f_geo, s)             # [B,N,CFUSE]
+z = f_fuse.mean(dim=1)                   # or z_weighted from M.1
+c = torch.cat([z, s, g], dim=-1)         # [B, CFUSE + CSEM + CGEO]
+```
+
+### M.3 Input projection bottleneck for fusion (capacity/control)
+
+- **What**: Project `concat([F_geo, s_tile])` down to a chosen `CFUSE` before the transformer.
+- **Why**: Controls compute/memory, adds learnable bottleneck; useful if `CSEM+CGEO` is large or you want tighter capacity.
+- **How**:
+```python
 class FusionTransformer1D(nn.Module):
     def __init__(self, c_geo, c_sem, c_fuse=512, depth=4, heads=8):
         super().__init__()
@@ -195,222 +728,9 @@ class FusionTransformer1D(nn.Module):
         )
         self.enc = nn.TransformerEncoder(enc_layer, num_layers=depth)
     def forward(self, f_geo, s):
-        # f_geo: [B,N,Cgeo], s: [B,Csem]
         B, N, _ = f_geo.shape
-        s_tile = s.unsqueeze(1).expand(B, N, -1)          # [B,N,Csem]
-        x = self.in_proj(torch.cat([f_geo, s_tile], -1))  # [B,N,Cfuse]
-        return self.enc(x)                                # [B,N,Cfuse]
+        x = torch.cat([f_geo, s.unsqueeze(1).expand(B, N, -1)], -1)
+        return self.enc(self.in_proj(x))
+```
 
-# grasp/models/contact_head.py
-import torch.nn as nn, torch
-
-class ContactHead(nn.Module):
-    def __init__(self, c_fuse, k=1):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(c_fuse, c_fuse//2), nn.ReLU(),
-            nn.Linear(c_fuse//2, k)
-        )
-    def forward(self, f_fuse):            # [B,N,Cfuse]
-        return self.net(f_fuse)          # [B,N,k]
-
-D4) Conditional Flow Matching (rectified flow)
-# grasp/models/flow_matching.py
-import torch, torch.nn as nn, math
-
-class PositionalEncoding1D(nn.Module):
-    def __init__(self, d=64, maxw=10000.0):
-        super().__init__(); self.d = d; self.maxw = maxw
-    def forward(self, t):
-        # t: [B,1] in [0,1]
-        device = t.device; d = self.d // 2
-        freqs = torch.exp(torch.arange(d, device=device) * (-math.log(self.maxw)/max(d-1,1)))
-        ang = 2*math.pi * t * freqs
-        return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)  # [B,d*2]
-
-class PoseFlow(nn.Module):
-    def __init__(self, d_pose, c_cond, hidden=1024):
-        super().__init__()
-        self.t_embed = nn.Sequential(PositionalEncoding1D(64), nn.Linear(64, 128), nn.SiLU())
-        self.net = nn.Sequential(
-            nn.Linear(d_pose + 128 + c_cond, hidden), nn.SiLU(),
-            nn.Linear(hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, d_pose)
-        )
-    def forward(self, x_t, t, c):   # x_t: [B,Dpose], t: [B], c: [B,Ccond]
-        te = self.t_embed(t.unsqueeze(-1))
-        return self.net(torch.cat([x_t, te, c], -1))
-
-D5) Full model wrapper
-# grasp/models/functional_grasp_model.py
-import torch, torch.nn as nn, torch.nn.functional as F
-from .semantics_qwen import QwenSemanticsEncoder
-from .pointnet2_encoder import PointNet2Encoder
-from .fusion_transformer import FusionTransformer1D
-from .contact_head import ContactHead
-from .flow_matching import PoseFlow
-
-class FunctionalGraspModel(nn.Module):
-    def __init__(self, qwen_name="Qwen/Qwen2.5-VL-3B-Instruct",
-                 CSEM=256, CGEO=256, CFUSE=512, CCOND=512,
-                 DPOSE=28, K_CONTACT=1):
-        super().__init__()
-        self.sem = QwenSemanticsEncoder(model_name=qwen_name, csem_proj=CSEM)
-        self.pc  = PointNet2Encoder(in_c=3, cgeo=CGEO)
-        self.fuse= FusionTransformer1D(c_geo=CGEO, c_sem=CSEM, c_fuse=CFUSE)
-        self.cm  = ContactHead(CFUSE, k=K_CONTACT)
-        self.cond= nn.Linear(CFUSE + CSEM + CGEO, CCOND)
-        self.flow= PoseFlow(d_pose=DPOSE, c_cond=CCOND)
-
-    def forward_backbone(self, images, texts, pts):
-        s = self.sem(images, texts)             # [B,CSEM]
-        f_geo, g = self.pc(pts)                 # [B,N,CGEO], [B,CGEO]
-        f_fuse = self.fuse(f_geo, s)            # [B,N,CFUSE]
-        logits_c = self.cm(f_fuse)              # [B,N,1]
-        p = torch.sigmoid(logits_c)             # [B,N,1]
-        w = p / (p.sum(1, keepdim=True) + 1e-6) # normalized weights
-        z = (w * f_fuse).sum(1)                 # [B,CFUSE]
-        c = self.cond(torch.cat([z, s, g], -1)) # [B,CCOND]
-        return f_fuse, logits_c, c
-
-    def forward_train(self, images, texts, pts, y_pose):
-        # contact map + CFM losses
-        f_fuse, logits_c, c = self.forward_backbone(images, texts, pts)
-
-        # Contact loss (binary)
-        # Expect batch provides contact_labels [B,N] in caller; use BCE as example
-        # Return logits_c and let caller compute BCE with labels to keep flexibility
-        return dict(f_fuse=f_fuse, logits_c=logits_c, cond=c)
-
-    def flow_step(self, x_t, t, c):
-        return self.flow(x_t, t, c)
-
-D6) Training loop (minimal)
-# grasp/train.py
-import torch, torch.nn.functional as F
-from torch.optim import AdamW
-from models.functional_grasp_model import FunctionalGraspModel
-
-def bce_logits(logits, labels):
-    return F.binary_cross_entropy_with_logits(logits.squeeze(-1), labels.float())
-
-def project_to_limits(x, lo, hi):   # x: [B,D]; lo/hi: vectors
-    return lo + (torch.tanh(x) + 1) * 0.5 * (hi - lo)
-
-def train_one_epoch(model, loader, opt, cfg, device="cuda"):
-    model.train()
-    for batch in loader:
-        images, texts, pts = batch["images"], batch["texts"], batch["points"].to(device)
-        y = batch["pose"].to(device)                            # [B,Dpose]
-        contact_labels = batch["contact_labels"].to(device)     # [B,N]
-
-        out = model.forward_train(images, texts, pts, y)
-        logits_c, c = out["logits_c"], out["cond"]
-
-        # Contact map loss
-        Lc = bce_logits(logits_c, contact_labels)
-
-        # Rectified Flow Matching
-        x0 = torch.randn_like(y)
-        t  = torch.rand(y.size(0), device=y.device)
-        x_t = (1 - t).unsqueeze(-1) * x0 + t.unsqueeze(-1) * y
-        v_star = y - x0                                        # constant target
-        v = model.flow_step(x_t, t, c)
-        Lfm = ((v - v_star)**2).mean()
-
-        loss = cfg["lambda_fm"]*Lfm + cfg["lambda_c"]*Lc
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-
-def sample(model, images, texts, pts, cfg, device="cuda", K=20, M=4):
-    model.eval()
-    with torch.no_grad():
-        _, logits_c, c = model.forward_backbone(images, texts, pts.to(device))
-        B, D = c.size(0), cfg["Dpose"]
-        best = []
-        for m in range(M):
-            x = torch.randn(B, D, device=device)
-            for k in range(K):
-                t = torch.full((B,), (k+0.5)/K, device=device)
-                x = x + (1.0/K) * model.flow_step(x, t, c)
-            best.append(x)
-        return torch.stack(best, dim=1)   # [B,M,D]
-
-E. Data interface you’ll want
-# Each batch should provide:
-batch = {
-  "images": [PIL.Image.Image, ...],  # length B
-  "texts":  [str, ...],              # length B, affordance prompt / recipe
-  "points": torch.Tensor[B,N,3],     # object point cloud in camera or object frame
-  "contact_labels": torch.Tensor[B,N], # 0/1 labels (or probabilities) for contact
-  "pose": torch.Tensor[B,Dpose],     # wrist pose + joint angles, in consistent frame
-}
-
-
-Contact labels can be painted from demonstration contacts (nearest‑surface assignment).
-Pose parameterization: (tx, ty, tz, rx, ry, rz) (axis‑angle) + finger joints; keep joint limits to post‑project or squash by tanh mapping.
-
-F. Default hyper‑parameters (good first pass)
-
-N = 1024 points (random uniform from mesh/pcd; oversample then FPS downsample is fine)
-
-CSEM = 256, CGEO = 256, CFUSE = 512, CCOND = 512
-
-DPOSE = 28 (adapt to your hand)
-
-Fusion Transformer: 4 layers, 8 heads
-
-Optimizer: AdamW, lr=1e-4 (backbone frozen), weight decay 0.05
-
-Loss weights: λ_fm=1.0, λ_c=1.0
-
-Qwen processor resolution: min_pixels=256*28*28, max_pixels=1024*28*28 as a balanced start (scale for memory). 
-Hugging Face
-
-G. Inference post‑processing & ranking (recommended)
-
-Generate M poses, score each with:
-
-Penetration penalty using a coarse SDF / signed ray distance against the object mesh;
-
-Contact coverage Σ_i p_contact(i) · 𝟙(point i within d of any finger link);
-
-Reachability and joint‑limit penalty.
-
-Pick top‑K by weighted sum.
-
-H. Ablations you can run (to validate choices)
-
-Remove the fusion transformer (replace with 1×1 MLP) → expect a drop in functional placement accuracy.
-
-Replace contact‑weighted pooling with average pooling.
-
-Supply text‑only vs image+text to Qwen to quantify visual gain.
-
-End‑to‑end fine‑tune a small LoRA on Qwen’s final layers (optional, after the base works).
-
-I. Checklist of invariants (prevents silent bugs)
-
-Coordinate frames are consistent (all in camera or object frame).
-
-p_contact is normalized before pooling (softmax or L1).
-
-Joint angles always projected back to limits after sampling.
-
-t ~ U[0,1] every step; use the same (x0, t) for vθ and the target v*.
-
-If you quantize Qwen weights for memory, keep the projection head and downstream modules in full precision.
-
-J. Quick smoke test (one batch)
-from grasp.models.functional_grasp_model import FunctionalGraspModel
-
-model = FunctionalGraspModel(DPOSE=28)
-dummy_images = [Image.open("example.jpg")] * 2     # two identical images just to test
-dummy_texts  = ["how to use this object to pour water?"] * 2
-dummy_pts    = torch.randn(2, 1024, 3)
-out = model.forward_backbone(dummy_images, dummy_texts, dummy_pts)
-for k,v in zip(["F_fuse","logits_c","cond"], out):
-    print(k, v.shape)
-# Expect: [B,N,Cfuse], [B,N,1], [B,Ccond]
+- If you enable this, set `CFUSE=c_fuse` and adjust conditioner/flow dims accordingly.

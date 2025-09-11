@@ -1,5 +1,37 @@
+# Dataset
 OakInk/
+data_cache/
 
-test.py
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
 
+
+# IDE
+.claude/
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Testing
+.pytest_cache/
+
+assets/
+test.py
+test_pipeline.py
+CLAUDE.md
+
+
+
+

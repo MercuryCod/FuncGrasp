@@ -5,15 +5,11 @@ Validates data loading and prepares batches for training.
 """
 
 import os
-import sys
 import argparse
 import numpy as np
 import torch
 from pathlib import Path
 from tqdm import tqdm
-
-# Add parent directory to path for imports
-sys.path.append(str(Path(__file__).parent.parent))
 
 from data.oakink_loader import create_oakink_loaders, OakInkPartDataset
 from models.functional_grasp_model import FunctionalGraspModel
