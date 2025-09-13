@@ -119,8 +119,10 @@ def test_model_forward(root_dir, device="cpu"):
     # Create minimal model
     model = FunctionalGraspModel(
         qwen_name="Qwen/Qwen2.5-VL-3B-Instruct",
-        CSEM=256, CGEO=256, CFUSE=512, CCOND=512,
-        DPOSE=28, K_CONTACT=1
+        CSEM=256,
+        CGEO=256,
+        DPOSE=28,
+        K_CONTACT=1
     ).to(device)
     
     # Get a batch

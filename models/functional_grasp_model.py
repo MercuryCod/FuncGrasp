@@ -52,18 +52,14 @@ class FunctionalGraspModel(nn.Module):
             freeze_backbone=freeze_qwen
         )
         
-        self.pc = PointNet2Encoder(
-            in_c=3,
-            cgeo=CGEO
-        )
+        self.pc = PointNet2Encoder(in_c=3, cgeo=CGEO)
         
         # CFUSE = CSEM + CGEO as per pipeline design
         CFUSE = CSEM + CGEO
         
         self.fuse = FusionTransformer1D(
             c_geo=CGEO,
-            c_sem=CSEM,
-            c_fuse=CFUSE
+            c_sem=CSEM
         )
         
         self.cm = ContactHead(
@@ -105,8 +101,10 @@ class FunctionalGraspModel(nn.Module):
         # Contact prediction
         logits_c = self.cm(f_fuse)  # [B, N, 1]
         
-        # Simple mean pooling as in baseline design
-        z = f_fuse.mean(dim=1)  # [B, CFUSE]
+        # Contact‑weighted pooling (baseline)
+        p = torch.sigmoid(logits_c)  # [B, N, 1]
+        w = p / (p.sum(dim=1, keepdim=True) + 1e-6)
+        z = (w * f_fuse).sum(dim=1)  # [B, CFUSE]
         c = z  # Conditioning is pooled fused features
         
         """

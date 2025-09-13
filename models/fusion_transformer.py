@@ -11,24 +11,22 @@ class FusionTransformer1D(nn.Module):
     """
     1D Fusion Transformer that combines semantic and geometric features.
     
-    Key operation: Broadcast semantic features to all points, concatenate with
-    geometric features, then apply transformer across points.
+    Baseline (no bottleneck): Broadcast semantic features to all points,
+    concatenate with geometric features, and run a Transformer across points
+    with model dimension d_model = c_geo + c_sem.
     """
-    def __init__(self, c_geo, c_sem, c_fuse=512, depth=4, heads=8):
+    def __init__(self, c_geo, c_sem, depth=4, heads=8):
         """
         Args:
             c_geo: Dimension of geometric features
             c_sem: Dimension of semantic features
-            c_fuse: Dimension of fused features
             depth: Number of transformer layers
             heads: Number of attention heads
         """
         super().__init__()
         
-        # Input projection: [F_geo ; tile(s,N)] → F_fuse
-        self.in_proj = nn.Linear(c_geo + c_sem, c_fuse)
-        
-        # Transformer encoder layers
+        c_fuse = c_geo + c_sem
+        # Transformer encoder layers (no input projection bottleneck)
         enc_layer = nn.TransformerEncoderLayer(
             d_model=c_fuse,
             nhead=heads,
@@ -55,13 +53,10 @@ class FusionTransformer1D(nn.Module):
         # Broadcast semantic features to all points
         s_tile = s.unsqueeze(1).expand(B, N, -1)  # [B, N, Csem]
         
-        # Concatenate geometric and semantic features
+        # Concatenate geometric and semantic features (no projection)
         x = torch.cat([f_geo, s_tile], dim=-1)  # [B, N, Cgeo + Csem]
         
-        # Project to fusion dimension
-        x = self.in_proj(x)  # [B, N, Cfuse]
-        
-        # Apply transformer
-        f_fuse = self.enc(x)  # [B, N, Cfuse]
+        # Apply transformer directly in concatenated dimension
+        f_fuse = self.enc(x)  # [B, N, Cgeo + Csem]
         
         return f_fuse

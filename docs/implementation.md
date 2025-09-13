@@ -39,8 +39,16 @@ FuncGrasp/
 ```bash
 conda create -n grasp python=3.10
 conda activate grasp
+
+# Core
 pip install torch torchvision transformers
-# Optional: pip install tensorboard trimesh qwen-vl-utils
+
+# Geometry backbone (required)
+pip install torch-geometric  # Use the official install command for your Torch/CUDA
+# See: https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
+
+# Extras
+pip install tensorboard trimesh qwen-vl-utils einops wandb
 ```
 
 ### Testing Pipeline
@@ -79,17 +87,20 @@ TRAINING = {
 - Frozen: ~0.2GB for gradients
 - Unfrozen: ~42GB for gradients (requires 24GB+ GPU)
 
-### 2. Baseline Pooling (Simple Mean)
-**Current implementation uses simple mean pooling:**
+### 2. Baseline Pooling (Contact‑weighted)
+**Current implementation uses contact‑weighted pooling:**
 ```python
-z = f_fuse.mean(dim=1)  # [B, CFUSE] mean pooled features
-c = z  # Conditioning is directly pooled features
+logits_c = self.cm(f_fuse)              # [B, N, 1]
+p = torch.sigmoid(logits_c)             # [B, N, 1]
+w = p / (p.sum(dim=1, keepdim=True) + 1e-6)
+z = (w * f_fuse).sum(dim=1)             # [B, CFUSE]
+c = z                                   # Conditioning is pooled fused
 ```
 
-**Optional advanced features (commented in code):**
-- **M.1 Contact-weighted pooling**: Weight by predicted contacts
-- **M.2 Global geometry skip**: Add [z, s, g] concatenation
-- **M.3 Input projection**: Already implemented in fusion transformer
+**Optional variants:**
+- **M.1 Plain mean pooling**: `z = f_fuse.mean(dim=1)`
+- **M.2 Global geometry skip**: Concatenate `[z, s, g]` before conditioning
+- **M.3 Input projection bottleneck**: Add an input projection in fusion transformer (not baseline)
 
 ### 3. Rectified Flow Matching
 **Training**: Sample time uniformly, interpolate linearly
@@ -115,6 +126,11 @@ for k in range(num_steps):
 - **Language**: Generated from semantic attributes (e.g., "grasp the bottle to pour")
 - **Contacts**: Approximated via 1cm hand-object proximity
 - **Pose**: 28D = 3D wrist + 25 flattened relative joints
+
+### 5. Geometry Backbone (PointNet++)
+- Uses `torch_geometric.nn.models.PointNet2` (PyTorch Geometric) as the only PointNet++ implementation.
+- This dependency is required. Install PyG matching your torch/CUDA.
+- Returns `(F_geo [B,N,Cgeo], g [B,Cgeo])` as conditioning for fusion.
 
 ## Configuration Reference
 

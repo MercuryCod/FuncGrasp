@@ -81,5 +81,6 @@ This directory contains the technical documentation for the FuncGrasp project.
 ## Recent Updates
 
 - **Fine-tuning Support**: Added `freeze_qwen` parameter to enable backbone fine-tuning (3.77B params)
-- **Baseline Implementation**: Simplified to mean pooling, advanced features in comments
-- **Repository Restructure**: Flattened directory structure, removed redundant `grasp/` folder
+- **Baseline Implementation**: Uses contact‑weighted pooling and a Transformer across points with no input bottleneck
+- **PointNet++ Backbone**: Uses PyTorch Geometric PointNet2 (required dependency)
+- **Repository Restructure**: Flattened directory structure; models live under top-level `models/`

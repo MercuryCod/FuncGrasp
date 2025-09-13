@@ -80,6 +80,9 @@ def train_one_epoch(model, loader, optimizer, cfg, device, writer, global_step):
     # Progress bar
     pbar = tqdm(loader, desc="Training")
     
+    grad_accum_steps = max(1, cfg['training'].get('gradient_accumulation', 1))
+    optimizer.zero_grad()
+
     for batch_idx, batch in enumerate(pbar):
         # Move data to device
         pts = batch["points"].to(device)
@@ -108,20 +111,21 @@ def train_one_epoch(model, loader, optimizer, cfg, device, writer, global_step):
         )
         
         # Total loss
-        loss = (cfg['training']['lambda_contact'] * loss_contact + 
+        loss = (cfg['training']['lambda_contact'] * loss_contact +
                 cfg['training']['lambda_flow'] * loss_flow)
-        
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(
-            trainable_params,
-            cfg['training']['gradient_clip']
-        )
-        
-        optimizer.step()
+
+        # Backward pass with gradient accumulation
+        (loss / grad_accum_steps).backward()
+
+        # Optimizer step on accumulation boundary or last batch
+        if ((batch_idx + 1) % grad_accum_steps == 0) or (batch_idx == len(loader) - 1):
+            # Gradient clipping just before stepping
+            torch.nn.utils.clip_grad_norm_(
+                trainable_params,
+                cfg['training']['gradient_clip']
+            )
+            optimizer.step()
+            optimizer.zero_grad()
         
         # Logging
         if batch_idx % cfg['training']['log_interval'] == 0:

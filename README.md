@@ -31,7 +31,13 @@ FuncGrasp/
 ```bash
 conda create -n grasp python=3.10
 conda activate grasp
-pip install torch torchvision transformers
+
+# Core
+pip install torch torchvision transformers qwen-vl-utils trimesh
+
+# Geometry backbone (required)
+pip install torch-geometric  # Use the official install command for your Torch/CUDA
+# See: https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
 ```
 
 ### Testing

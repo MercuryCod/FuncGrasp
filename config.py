@@ -5,6 +5,7 @@ Contains all hyperparameters and settings.
 
 import torch
 import os
+import copy
 
 
 class Config:
@@ -112,16 +113,16 @@ class Config:
             config dict
         """
         config = {
-            'model': cls.MODEL,
-            'training': cls.TRAINING,
-            'data': cls.DATA,
+            'model': copy.deepcopy(cls.MODEL),
+            'training': copy.deepcopy(cls.TRAINING),
+            'data': copy.deepcopy(cls.DATA),
             'device': cls.DEVICE,
             'num_workers': cls.NUM_WORKERS,
             'fp16': cls.FP16,
-            'flow': cls.FLOW,
-            'paths': cls.PATHS,
-            'qwen': cls.QWEN,
-            'eval': cls.EVAL,
+            'flow': copy.deepcopy(cls.FLOW),
+            'paths': copy.deepcopy(cls.PATHS),
+            'qwen': copy.deepcopy(cls.QWEN),
+            'eval': copy.deepcopy(cls.EVAL),
         }
         
         # Override with CPU config if not using GPU
