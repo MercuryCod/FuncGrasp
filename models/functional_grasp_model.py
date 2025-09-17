@@ -27,8 +27,6 @@ class FunctionalGraspModel(nn.Module):
     """
     def __init__(
         self,
-        qwen_name="Qwen/Qwen2.5-VL-3B-Instruct",
-        freeze_qwen=True,
         CSEM=256,
         CGEO=256,
         DPOSE=28,
@@ -36,8 +34,6 @@ class FunctionalGraspModel(nn.Module):
     ):
         """
         Args:
-            qwen_name: Pretrained Qwen model name
-            freeze_qwen: Whether to freeze Qwen backbone
             CSEM: Semantic feature dimension
             CGEO: Geometric feature dimension
             DPOSE: Pose dimension (wrist + joints)
@@ -46,10 +42,12 @@ class FunctionalGraspModel(nn.Module):
         super().__init__()
         
         # Component models
-        self.sem = QwenSemanticsEncoder(
-            model_name=qwen_name,
-            csem_proj=CSEM,
-            freeze_backbone=freeze_qwen
+        # Qwen2.5-VL always trainable; returns last_hidden_state [B, L, 3584]
+        self.sem = QwenSemanticsEncoder()
+        # Pool + project semantic hidden states to CSEM for fusion
+        self.sem_proj = nn.Sequential(
+            nn.LayerNorm(3584),
+            nn.Linear(3584, CSEM)
         )
         
         self.pc = PN2GeometryEncoder(in_c=3, cgeo=CGEO)
@@ -89,8 +87,9 @@ class FunctionalGraspModel(nn.Module):
             logits_c: [B, N, 1] contact logits
             c: [B, CFUSE] conditioning vector (pooled fused)
         """
-        # Semantic encoding
-        s = self.sem(images, texts)  # [B, CSEM]
+        # Semantic encoding: hidden states [B, L, 3584] → pooled+projected s [B, CSEM]
+        s_hidden = self.sem(images, texts)       # [B, L, 3584]
+        s = self.sem_proj(s_hidden.mean(dim=1))  # [B, CSEM]
         
         # Geometric encoding
         f_geo, _ = self.pc(pts)  # [B, N, CGEO], global features not used in baseline

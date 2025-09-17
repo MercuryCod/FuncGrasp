@@ -41,6 +41,11 @@ This directory contains the technical documentation for the FuncGrasp project.
    - Basic usage
 
 6. **[pointnet2.md](pointnet2.md)** - PointNet++ Geometry Encoder
+
+## Recent Updates
+
+- Qwen2.5‑VL (3B) is always trainable; the semantics encoder returns hidden states `[B, L, 3584]`. Pooling/projection to `CSEM` happens inside `FunctionalGraspModel`.
+- Custom PointNet++ encoders (SSG/MSG) implemented with PyG primitives. See `pointnet2.md`.
    - Architecture and parameterization
    - I/O shapes and feature flow
    - Tuning guide and best practices

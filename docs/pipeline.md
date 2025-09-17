@@ -10,7 +10,7 @@
 
 ### Architecture Flow
 ```
-(Image, Text) ──► Qwen2.5-VL ──► s ∈ ℝ^{B×256}                 [Semantic features]
+(Image, Text) ──► Qwen2.5-VL ──► H ∈ ℝ^{B×L×3584} ──► pool+proj ──► s ∈ ℝ^{B×256}
      ↓
 Point Cloud ────► PointNet++ ──► F_geo ∈ ℝ^{B×N×256}          [Geometric features]
      ↓
@@ -43,10 +43,7 @@ from models.functional_grasp_model import FunctionalGraspModel
 
 def train_functional_grasp(cfg):
     # Initialize model
-    model = FunctionalGraspModel(
-        qwen_name="Qwen/Qwen2.5-VL-3B-Instruct",
-        CSEM=256, CGEO=256, DPOSE=28
-    )
+    model = FunctionalGraspModel(CSEM=256, CGEO=256, DPOSE=28)
     
     # Data loaders with OakInk
     train_loader, val_loader = create_oakink_loaders(
@@ -56,7 +53,7 @@ def train_functional_grasp(cfg):
         contact_threshold=0.01  # 1cm for contact approximation
     )
     
-    # Optimizer (only non-frozen params)
+    # Optimizer (all trainable params)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(trainable_params, lr=1e-4, weight_decay=0.05)
     
@@ -190,7 +187,7 @@ FuncGrasp/
 
 ## E. Model Architecture Components
 
-### E.1 Qwen2.5-VL Semantics Encoder (Frozen)
+### E.1 Qwen2.5-VL Semantics Encoder (Trainable by default)
 
 ```python
 # models/semantics_qwen.py
@@ -201,10 +198,10 @@ from qwen_vl_utils import process_vision_info
 class QwenSemanticsEncoder(nn.Module):
     """
     Wraps Qwen2.5-VL to produce a pooled multimodal embedding s ∈ ℝ^{B×CSEM}.
-    Backbone can be frozen or fine-tuned based on freeze_backbone parameter.
+    Backbone is trainable by default; set freeze_backbone=True to freeze.
     """
     def __init__(self, model_name="Qwen/Qwen2.5-VL-3B-Instruct",
-                 csem_proj=256, freeze_backbone=True,
+                 csem_proj=256, freeze_backbone=False,
                  min_pixels=None, max_pixels=None, 
                  device_map="auto", dtype=torch.bfloat16):
         super().__init__()
@@ -215,14 +212,14 @@ class QwenSemanticsEncoder(nn.Module):
         self.backbone = Qwen2_5_VLModel.from_pretrained(
             model_name, torch_dtype=dtype, device_map=device_map
         )
-        # Optionally freeze Qwen parameters
+        # Train or freeze Qwen parameters
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad_(False)
         else:
             # Enable gradient checkpointing for memory efficiency
             self.backbone.gradient_checkpointing_enable()
-        hidden = self.backbone.config.hidden_size
+        hidden = self.backbone.config.hidden_size  # 3584
         self.proj = nn.Sequential(
             nn.LayerNorm(hidden),
             nn.Linear(hidden, csem_proj)

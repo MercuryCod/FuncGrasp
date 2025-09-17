@@ -64,28 +64,14 @@ python train.py --data_path ./OakInk --epochs 100
 ## Critical Implementation Details
 
 ### 1. Qwen2.5-VL Integration
-- **Model**: `Qwen/Qwen2.5-VL-3B-Instruct` (3.75B params)
-- **Freezing Options**:
-  - `freeze_qwen=True` (default): Only projection layer trainable (15.4M params)
-  - `freeze_qwen=False`: Full fine-tuning (3.77B params trainable)
+- **Model**: `Qwen/Qwen2.5-VL-3B-Instruct` (3.75B params), always trainable
 - **Processing**: Joint image-text through chat template
-- **Output**: Global semantic feature via masked pooling
+- **Output**: Hidden states `last_hidden_state ∈ ℝ^{B×L×3584}` from the backbone
+- **Pooling/Projection**: Performed in `FunctionalGraspModel` via `mean over L` then `LayerNorm+Linear` to `CSEM`
 
-**Fine-tuning Configuration** (when `freeze_qwen=False`):
-```python
-MODEL = {
-    'freeze_qwen': False,  # Enable gradient flow through backbone
-}
-TRAINING = {
-    'backbone_lr': 1e-5,   # Lower LR for pretrained weights
-    'learning_rate': 1e-4, # Higher LR for new layers
-    'batch_size': 1,       # Reduce for memory
-    'gradient_accumulation': 8,  # Effective batch size
-}
-```
-**Memory Requirements**:
-- Frozen: ~0.2GB for gradients
-- Unfrozen: ~42GB for gradients (requires 24GB+ GPU)
+**Training Notes**:
+- Use gradient checkpointing (enabled in code) to reduce memory
+- Consider lower LR for backbone parameters if you add optimizer groups later
 
 ### 2. Baseline Pooling (Contact‑weighted)
 **Current implementation uses contact‑weighted pooling:**
@@ -128,9 +114,9 @@ for k in range(num_steps):
 - **Pose**: 28D = 3D wrist + 25 flattened relative joints
 
 ### 5. Geometry Backbone (PointNet++)
-- Uses `torch_geometric.nn.models.PointNet2` (PyTorch Geometric) as the only PointNet++ implementation.
-- This dependency is required. Install PyG matching your torch/CUDA.
-- Returns `(F_geo [B,N,Cgeo], g [B,Cgeo])` as conditioning for fusion.
+- Custom PointNet++ encoders implemented using PyG primitives (`fps`, `radius`, `PointNetConv`, `knn_interpolate`).
+- Classes: `PN2GeometryEncoder` (SSG) and `PN2GeometryEncoderMSG` (MSG)
+- Returns `(F_geo [B,N,Cgeo], g [B,Cgeo])` for fusion/conditioning.
 
 ## Configuration Reference
 
@@ -268,7 +254,7 @@ python -c "from models import PointNet2Encoder; print('Import OK')"
 
 ## Important Reminders
 
-1. **Qwen is frozen**: Only projection layer trains (15.6M params total)
+1. **Qwen is trainable**: backbone gradients flow end-to-end
 2. **Contact labels are approximate**: 1cm threshold is heuristic
 3. **Semantic features used twice**: In fusion AND conditioning
 4. **Flow is rectified**: Linear interpolation, constant velocity
