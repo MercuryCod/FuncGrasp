@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from .semantics_qwen import QwenSemanticsEncoder
-from .pointnet2_encoder import PointNet2Encoder
+from .pointnet2_encoder import PN2GeometryEncoder
 from .fusion_transformer import FusionTransformer1D
 from .contact_head import ContactHead
 from .flow_matching import PoseFlow
@@ -52,7 +52,7 @@ class FunctionalGraspModel(nn.Module):
             freeze_backbone=freeze_qwen
         )
         
-        self.pc = PointNet2Encoder(in_c=3, cgeo=CGEO)
+        self.pc = PN2GeometryEncoder(in_c=3, cgeo=CGEO)
         
         # CFUSE = CSEM + CGEO as per pipeline design
         CFUSE = CSEM + CGEO

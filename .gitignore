@@ -26,9 +26,9 @@ Thumbs.db
 
 # Testing
 .pytest_cache/
+test*
 
 assets/
-test.py
 test_pipeline.py
 CLAUDE.md
 

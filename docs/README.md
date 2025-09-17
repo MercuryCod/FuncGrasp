@@ -40,6 +40,11 @@ This directory contains the technical documentation for the FuncGrasp project.
    - Installation instructions
    - Basic usage
 
+6. **[pointnet2.md](pointnet2.md)** - PointNet++ Geometry Encoder
+   - Architecture and parameterization
+   - I/O shapes and feature flow
+   - Tuning guide and best practices
+
 ## Documentation Maintenance
 
 ### When to Update Each Document

@@ -1,7 +1,7 @@
 """
-Qwen2.5-VL Semantics Encoder
-Wraps Qwen2.5-VL to produce a pooled multimodal embedding s ∈ ℝ^{B×Csem_proj}.
-Default: freeze Qwen and learn only a projection.
+Qwen2.5-VL-3B-Instruct Semantics Encoder
+Wraps Qwen2.5-VL-3B-Instruct to produce multimodal embeddings s ∈ ℝ^{B×Seq_len×3584}.
+Trains the entire Qwen backbone end-to-end for optimal performance.
 """
 
 import torch
@@ -12,20 +12,23 @@ from qwen_vl_utils import process_vision_info
 
 class QwenSemanticsEncoder(nn.Module):
     """
-    Wraps Qwen2.5-VL to produce a pooled multimodal embedding s ∈ ℝ^{B×Csem_proj}.
-    Default: freeze Qwen and learn only a projection.
+    Wraps Qwen2.5-VL-3B-Instruct to produce multimodal embeddings s ∈ ℝ^{B×Seq_len×3584}.
+    Trains the entire Qwen backbone end-to-end for optimal performance.
+    
+    Fixed model: Qwen/Qwen2.5-VL-3B-Instruct
+    Output dimensions: [Batch_size, Sequence_length, 3584]
     """
     def __init__(
         self,
-        model_name="Qwen/Qwen2.5-VL-3B-Instruct",
-        csem_proj=256,
-        freeze_backbone=True,  # Control whether to freeze Qwen
         min_pixels=None,
         max_pixels=None,
         device_map="auto",
         dtype=torch.bfloat16
     ):
         super().__init__()
+        
+        # Fixed model: Qwen2.5-VL-3B-Instruct
+        model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
         
         # Initialize processor for handling images and text
         self.processor = AutoProcessor.from_pretrained(
@@ -41,20 +44,15 @@ class QwenSemanticsEncoder(nn.Module):
             device_map=device_map
         )
         
-        # Optionally freeze Qwen parameters
-        if freeze_backbone:
-            for p in self.backbone.parameters():
-                p.requires_grad_(False)
-        else:
-            # Enable gradient checkpointing for memory efficiency
-            self.backbone.gradient_checkpointing_enable()
+
+        # Enable gradient checkpointing for memory efficiency
+        self.backbone.gradient_checkpointing_enable()
         
-        # Learnable projection layer
-        hidden = self.backbone.config.hidden_size
-        self.proj = nn.Sequential(
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, csem_proj)
-        )
+        # Keep backbone trainable for end-to-end learning
+        
+        # Store hidden size for reference
+        # Qwen2.5-VL-3B-Instruct has hidden_size = 3584
+        self.hidden_size = self.backbone.config.hidden_size  # 3584
 
     def _pack(self, images, texts):
         """
@@ -110,18 +108,17 @@ class QwenSemanticsEncoder(nn.Module):
             texts: List[str]
         
         Returns:
-            s: Semantic embedding [B, Csem_proj]
+            s: Semantic embedding [B, Seq_len, 3584]
+            - B: Batch size
+            - Seq_len: Variable sequence length (image + text tokens)
+            - 3584: Fixed hidden dimension for Qwen2.5-VL-3B-Instruct
         """
-        # Pack inputs (with or without gradients based on freeze_backbone)
-        if self.backbone.training and any(p.requires_grad for p in self.backbone.parameters()):
-            inputs = self._pack(images, texts)
-        else:
-            with torch.inference_mode():
-                inputs = self._pack(images, texts)
+        # Pack inputs (always allow gradients since backbone is trainable)
+        inputs = self._pack(images, texts)
         
-        # Move to correct device
-        device = next(self.proj.parameters()).device
-        inputs = inputs.to(device)
+        # Move to correct device (use backbone parameters since we don't have proj layer yet)
+        device = next(self.backbone.parameters()).device
+        inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         
         # Get hidden states from backbone
         out = self.backbone(
@@ -130,11 +127,8 @@ class QwenSemanticsEncoder(nn.Module):
             return_dict=True
         )
         
-        # Masked mean pool over tokens (text+vision) → global multimodal vector
-        mask = inputs.attention_mask.float().unsqueeze(-1)  # [B, L, 1]
-        pooled = (out.last_hidden_state * mask).sum(dim=1) / (mask.sum(dim=1).clamp_min(1e-6))
+        out = out.last_hidden_state  # Shape: [B, Seq_len, 3584]
         
-        # Project to semantic embedding space
-        s = self.proj(pooled)  # [B, Csem_proj]
-        
-        return s
+        # Output the last hidden state, no projection
+        # Final output shape: [B, Seq_len, 3584] for Qwen2.5-VL-3B-Instruct
+        return out
