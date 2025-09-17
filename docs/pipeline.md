@@ -10,7 +10,7 @@
 
 ### Architecture Flow
 ```
-(Image, Text) ──► Qwen2.5-VL ──► H ∈ ℝ^{B×L×3584} ──► pool+proj ──► s ∈ ℝ^{B×256}
+(Image, Text) ──► Qwen2.5-VL ──► H ∈ ℝ^{B×L_max×2048} ──► masked‑pool+proj ──► s ∈ ℝ^{B×256}
      ↓
 Point Cloud ────► PointNet++ ──► F_geo ∈ ℝ^{B×N×256}          [Geometric features]
      ↓
@@ -22,6 +22,17 @@ Contact‑weighted Pooling ──► z ∈ ℝ^{B×(CSEM+CGEO)}              [Gl
      ↓
 Flow Matching ──► pose ∈ ℝ^{B×28}                               [Grasp pose]
 ```
+
+#### Caveat (semantics pooling)
+When pooling the Qwen hidden states `H ∈ ℝ^{B×L_max×2048}` to obtain `s ∈ ℝ^{B×256}`, prefer attention‑mask aware pooling instead of a plain mean to avoid including padding tokens:
+
+```python
+# H: [B, L_max, 2048], attention_mask: [B, L_max]
+mask = attention_mask.float().unsqueeze(-1)          # [B, L, 1]
+pooled = (H * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1e-6)
+s = sem_proj(pooled)                                  # LayerNorm+Linear → [B, 256]
+```
+The current baseline uses a simple mean over tokens; switch to masked mean for strict correctness with variable sequence lengths.
 
 ### Key Dimensions
 - B: Batch size (2-4 for CPU, 8-32 for GPU)
@@ -192,7 +203,7 @@ FuncGrasp/
 ```python
 # models/semantics_qwen.py
 import torch, torch.nn as nn
-from transformers import AutoProcessor, Qwen2_5_VLModel
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from qwen_vl_utils import process_vision_info
 
 class QwenSemanticsEncoder(nn.Module):
@@ -209,7 +220,7 @@ class QwenSemanticsEncoder(nn.Module):
             model_name, min_pixels=min_pixels, max_pixels=max_pixels
         )
         # Use the *backbone* (no LM head) to access hidden states
-        self.backbone = Qwen2_5_VLModel.from_pretrained(
+        self.backbone = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_name, torch_dtype=dtype, device_map=device_map
         )
         # Train or freeze Qwen parameters
@@ -219,7 +230,7 @@ class QwenSemanticsEncoder(nn.Module):
         else:
             # Enable gradient checkpointing for memory efficiency
             self.backbone.gradient_checkpointing_enable()
-        hidden = self.backbone.config.hidden_size  # 3584
+        hidden = self.backbone.config.hidden_size  # 2048
         self.proj = nn.Sequential(
             nn.LayerNorm(hidden),
             nn.Linear(hidden, csem_proj)
@@ -272,11 +283,11 @@ def fps(x, M):
         farthest = torch.max(dist, dim=1).indices
     return centroids
 
-class PointNet2Encoder(nn.Module):
+class PN2GeometryEncoder(nn.Module):
     """PointNet++ encoder using torch_geometric.nn.models.PointNet2 (required)."""
     def __init__(self, in_c=3, cgeo=256):
         super().__init__()
-        from models.pointnet2_encoder import PointNet2Encoder as Impl
+        from models.pointnet2_encoder import PN2GeometryEncoder as Impl
         self.impl = Impl(in_c=in_c, cgeo=cgeo)
     def forward(self, pts):
         return self.impl(pts)
@@ -366,7 +377,7 @@ class PoseFlow(nn.Module):
 # models/functional_grasp_model.py
 import torch, torch.nn as nn
 from .semantics_qwen import QwenSemanticsEncoder
-from .pointnet2_encoder import PointNet2Encoder
+from .pointnet2_encoder import PN2GeometryEncoder
 from .fusion_transformer import FusionTransformer1D
 from .contact_head import ContactHead
 from .flow_matching import PoseFlow
@@ -377,7 +388,7 @@ class FunctionalGraspModel(nn.Module):
         super().__init__()
         self.sem = QwenSemanticsEncoder(model_name=qwen_name, csem_proj=CSEM)
         # PointNet++ via PyTorch Geometric (required)
-        self.pc = PointNet2Encoder(in_c=3, cgeo=CGEO)
+        self.pc = PN2GeometryEncoder(in_c=3, cgeo=CGEO)
         CFUSE = CSEM + CGEO
         # Fusion uses a Transformer across points (horizontal)
         self.fuse = FusionTransformer1D(c_geo=CGEO, c_sem=CSEM)
@@ -425,7 +436,6 @@ CONFIG = {
     'training': {
         'batch_size': 4 if torch.cuda.is_available() else 2,
         'learning_rate': 1e-4,  # For new layers
-        'backbone_lr': 1e-5,    # For Qwen backbone (if unfrozen)
         'weight_decay': 0.05,
         'epochs': 100,
         'gradient_clip': 1.0,
@@ -642,7 +652,6 @@ MODEL = {
     'freeze_qwen': False,  # Enable gradient flow
 }
 TRAINING = {
-    'backbone_lr': 1e-5,   # Lower LR for pretrained weights
     'learning_rate': 1e-4, # Higher LR for new layers
     'batch_size': 1,       # Reduce for memory
     'gradient_accumulation': 8,

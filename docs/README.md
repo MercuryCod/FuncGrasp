@@ -44,7 +44,7 @@ This directory contains the technical documentation for the FuncGrasp project.
 
 ## Recent Updates
 
-- Qwen2.5‑VL (3B) is always trainable; the semantics encoder returns hidden states `[B, L, 3584]`. Pooling/projection to `CSEM` happens inside `FunctionalGraspModel`.
+- Qwen2.5‑VL (3B) is always trainable; the semantics encoder returns hidden states `[B, L_max, 2048]` for single text with multiple images. Pooling/projection to `CSEM` happens inside `FunctionalGraspModel`.
 - Custom PointNet++ encoders (SSG/MSG) implemented with PyG primitives. See `pointnet2.md`.
    - Architecture and parameterization
    - I/O shapes and feature flow
@@ -90,7 +90,7 @@ This directory contains the technical documentation for the FuncGrasp project.
 
 ## Recent Updates
 
-- **Fine-tuning Support**: Added `freeze_qwen` parameter to enable backbone fine-tuning (3.77B params)
+- **Semantics Batching**: Qwen2.5‑VL returns hidden states `[B, L_max, 2048]` (batched text+images). Pooling/projection to `CSEM` happens inside `FunctionalGraspModel`.
 - **Baseline Implementation**: Uses contact‑weighted pooling and a Transformer across points with no input bottleneck
 - **PointNet++ Backbone**: Uses PyTorch Geometric PointNet2 (required dependency)
 - **Repository Restructure**: Flattened directory structure; models live under top-level `models/`

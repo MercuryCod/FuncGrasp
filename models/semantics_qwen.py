@@ -1,34 +1,39 @@
 """
 Qwen2.5-VL-3B-Instruct Semantics Encoder
-Wraps Qwen2.5-VL-3B-Instruct to produce multimodal embeddings s ∈ ℝ^{B×Seq_len×3584}.
-Trains the entire Qwen backbone end-to-end for optimal performance.
+Wraps Qwen2.5-VL-3B-Instruct and returns batched token hidden states H ∈ ℝ^{B×L_max×2048}
+for downstream masked pooling. Trains the entire Qwen backbone end-to-end.
+Each sample in the batch has its own text and set of images.
 """
-
+import os
 import torch
 import torch.nn as nn
-from transformers import AutoProcessor, Qwen2_5_VLModel
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from qwen_vl_utils import process_vision_info
 
 
+MODEL_PATH = "/root/models"
+
 class QwenSemanticsEncoder(nn.Module):
     """
-    Wraps Qwen2.5-VL-3B-Instruct to produce multimodal embeddings s ∈ ℝ^{B×Seq_len×3584}.
+    Wraps Qwen2.5-VL-3B-Instruct to produce batched token hidden states H ∈ ℝ^{B×L_max×2048}.
     Trains the entire Qwen backbone end-to-end for optimal performance.
     
     Fixed model: Qwen/Qwen2.5-VL-3B-Instruct
-    Output dimensions: [Batch_size, Sequence_length, 3584]
+    Output: last_hidden_state [B, L_max, 2048] where B is batch size
+    Each sample in the batch has its own text prompt and set of images.
     """
     def __init__(
         self,
         min_pixels=None,
         max_pixels=None,
-        device_map="auto",
+        device=None,
         dtype=torch.bfloat16
     ):
         super().__init__()
         
         # Fixed model: Qwen2.5-VL-3B-Instruct
-        model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
+        model_name = "Qwen2.5-VL-3B-Instruct"
+        model_name = os.path.join(MODEL_PATH, model_name)
         
         # Initialize processor for handling images and text
         self.processor = AutoProcessor.from_pretrained(
@@ -38,11 +43,15 @@ class QwenSemanticsEncoder(nn.Module):
         )
         
         # Use the *backbone* (no LM head) to access hidden states
-        self.backbone = Qwen2_5_VLModel.from_pretrained(
+        self.backbone = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=dtype,
-            device_map=device_map
+            device_map=None  # Don't use device_map to avoid multi-GPU issues
         )
+        
+        # Move to device if specified
+        if device is not None:
+            self.backbone = self.backbone.to(device)
         
 
         # Enable gradient checkpointing for memory efficiency
@@ -51,70 +60,70 @@ class QwenSemanticsEncoder(nn.Module):
         # Keep backbone trainable for end-to-end learning
         
         # Store hidden size for reference
-        # Qwen2.5-VL-3B-Instruct has hidden_size = 3584
-        self.hidden_size = self.backbone.config.hidden_size  # 3584
+        # Qwen2.5-VL-3B-Instruct has hidden_size = 2048
+        self.hidden_size = self.backbone.config.hidden_size  # 2048
 
-    def _pack(self, images, texts):
+    def _pack_batch(self, images_list, texts_list):
         """
-        Pack images and texts into processor format.
+        Pack batched images and texts into processor format.
         
         Args:
-            images: list of PIL.Image or paths
-            texts: list[str], length B
+            images_list: List[List[PIL.Image]] - B lists of images
+            texts_list: List[str] - B text prompts
         
         Returns:
             Processed inputs ready for the model
         """
-        # One-message-per-sample batching
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": im},
-                    {"type": "text", "text": tx}
-                ]
-            }
-            for im, tx in zip(images, texts)
-        ]
+        all_messages = []
+        all_text_inputs = []
         
-        # Apply chat template
-        text_inputs = [
-            self.processor.apply_chat_template(
-                m, tokenize=False, add_generation_prompt=False
+        for images, text in zip(images_list, texts_list):
+            # Format messages for each sample
+            if images:
+                content = []
+                for img in images:
+                    content.append({"type": "image", "image": img})
+                content.append({"type": "text", "text": text})
+            else:
+                content = [{"type": "text", "text": text}]
+            
+            messages = [{"role": "user", "content": content}]
+            all_messages.append(messages)
+            
+            # Apply chat template
+            text_input = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
             )
-            for m in messages
-        ]
+            all_text_inputs.append(text_input)
+            
+        # Process vision info once for the whole batch (aligned with official docs)
+        image_inputs, video_inputs = process_vision_info(all_messages)
         
-        # Process vision info
-        image_inputs, video_inputs = zip(*[process_vision_info(m) for m in messages])
-        
-        # Create processor inputs
-        proc = self.processor(
-            text=text_inputs,
-            images=list(image_inputs),
-            videos=list(video_inputs),
+        # Create batched processor inputs
+        inputs = self.processor(
+            text=all_text_inputs,
+            images=image_inputs,
+            videos=video_inputs,
             padding=True,
             return_tensors="pt"
         )
         
-        return proc
+        return inputs
 
-    def forward(self, images, texts):
+    def forward(self, images_list, texts_list):
         """
-        Forward pass to get semantic embedding.
+        Forward pass to get batched token hidden states and attention masks.
         
         Args:
-            images: List[PIL.Image]
-            texts: List[str]
+            images_list: List[List[PIL.Image]] - B lists of images (one per sample)
+            texts_list: List[str] - B text prompts (one per sample)
         
         Returns:
-            s: Semantic embedding [B, Seq_len, 3584]
-            - B: Batch size
-            - Seq_len: Variable sequence length (image + text tokens)
-            - 3584: Fixed hidden dimension for Qwen2.5-VL-3B-Instruct
+            H: last_hidden_state [B, L_max, 2048]
+            attention_mask: [B, L_max]
         """
-        # Pack inputs (always allow gradients since backbone is trainable)
-        inputs = self._pack(images, texts)
+        # Pack batched inputs
+        inputs = self._pack_batch(images_list, texts_list)
         
         # Move to correct device (use backbone parameters since we don't have proj layer yet)
         device = next(self.backbone.parameters()).device
@@ -123,12 +132,11 @@ class QwenSemanticsEncoder(nn.Module):
         # Get hidden states from backbone
         out = self.backbone(
             **inputs,
-            output_hidden_states=False,
+            output_hidden_states=True,  # Need this to get hidden states
             return_dict=True
         )
         
-        out = out.last_hidden_state  # Shape: [B, Seq_len, 3584]
-        
-        # Output the last hidden state, no projection
-        # Final output shape: [B, Seq_len, 3584] for Qwen2.5-VL-3B-Instruct
-        return out
+        # Extract last hidden state from the tuple of all layer outputs
+        H = out.hidden_states[-1]  # [B, L, 2048]
+        attention_mask = inputs.get("attention_mask", None)  # [B, L]
+        return H, attention_mask

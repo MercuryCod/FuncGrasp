@@ -52,9 +52,7 @@ pip install tensorboard trimesh qwen-vl-utils einops wandb
 ```
 
 ### Testing Pipeline
-```bash
-python test_pipeline.py  # Tests with mock Qwen (no GPU needed)
-```
+Use `pipeline_inspector.py` to visualize shapes at each stage with real Qwen.
 
 ### Training
 ```bash
@@ -66,8 +64,15 @@ python train.py --data_path ./OakInk --epochs 100
 ### 1. Qwen2.5-VL Integration
 - **Model**: `Qwen/Qwen2.5-VL-3B-Instruct` (3.75B params), always trainable
 - **Processing**: Joint image-text through chat template
-- **Output**: Hidden states `last_hidden_state ∈ ℝ^{B×L×3584}` from the backbone
+- **Output**: Hidden states `last_hidden_state ∈ ℝ^{B×L_max×2048}` from the backbone (batched: each item has its own text+images)
 - **Pooling/Projection**: Performed in `FunctionalGraspModel` via `mean over L` then `LayerNorm+Linear` to `CSEM`
+
+Note (recommended pooling): Use attention‑mask aware pooling to avoid padded tokens impacting the pooled representation. Example:
+```python
+mask = attention_mask.float().unsqueeze(-1)  # [B, L, 1]
+pooled = (H * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1e-6)
+s = sem_proj(pooled)
+```
 
 **Training Notes**:
 - Use gradient checkpointing (enabled in code) to reduce memory
@@ -249,7 +254,7 @@ with torch.no_grad():
 python test_pipeline.py
 
 # Run specific component tests
-python -c "from models import PointNet2Encoder; print('Import OK')"
+python -c "from models.pointnet2_encoder import PN2GeometryEncoder; print('Import OK')"
 ```
 
 ## Important Reminders
