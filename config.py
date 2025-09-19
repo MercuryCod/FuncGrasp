@@ -81,6 +81,15 @@ class Config:
         'num_val_samples': 50,  # Number of validation samples
         'num_poses_per_object': 4,  # M poses to generate per object
     }
+
+    # FSDP settings (optional, used when training with FSDP)
+    FSDP = {
+        'enabled': False,  # Set to True when using train_fsdp.py
+        'sharding_strategy': 'FULL_SHARD',
+        'mixed_precision': True,
+        'cpu_offload': False,
+        'min_params_to_wrap': 100_000_000,
+    }
     
     @classmethod
     def get_config(cls, mode='train'):
@@ -103,6 +112,7 @@ class Config:
             'flow': copy.deepcopy(cls.FLOW),
             'paths': copy.deepcopy(cls.PATHS),
             'eval': copy.deepcopy(cls.EVAL),
+            'fsdp': copy.deepcopy(cls.FSDP),
         }
         
         # Override with CPU config if not using GPU

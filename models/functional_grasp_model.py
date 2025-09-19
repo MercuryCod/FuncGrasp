@@ -221,3 +221,39 @@ class FunctionalGraspModel(nn.Module):
                 x = x + dt * v
             
             return x
+
+    def get_fsdp_wrap_params(self):
+        """
+        Get parameters for FSDP wrapping.
+        Returns modules that should be wrapped separately for optimal memory/compute.
+        """
+        wrap_modules = []
+
+        # Qwen encoder is the largest component and should be wrapped separately
+        if hasattr(self.sem, 'qwen'):
+            wrap_modules.append(('sem.qwen', self.sem.qwen))
+
+        # Other large components that benefit from separate wrapping
+        wrap_modules.extend([
+            ('pc', self.pc),  # PointNet++ encoder
+            ('fuse', self.fuse),  # Fusion transformer
+            ('flow', self.flow),  # Flow matching module
+        ])
+
+        return wrap_modules
+
+    def configure_for_fsdp(self):
+        """
+        Configure model for FSDP training.
+        This method can be called before wrapping with FSDP to set optimal settings.
+        """
+        # Ensure all parameters are in float32 initially (FSDP will handle mixed precision)
+        for param in self.parameters():
+            param.data = param.data.float()
+
+        # If Qwen is frozen, ensure gradients are disabled
+        if hasattr(self.sem, 'freeze_qwen') and self.sem.freeze_qwen:
+            for param in self.sem.qwen.parameters():
+                param.requires_grad = False
+
+        return self
