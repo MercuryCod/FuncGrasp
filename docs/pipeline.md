@@ -38,7 +38,7 @@ The current baseline uses a simple mean over tokens; switch to masked mean for s
 - B: Batch size (2-4 for CPU, 8-32 for GPU)
 - N: Points per object (1024)
 - Feature dimensions: CSEM=256, CGEO=256, CFUSE=CSEM+CGEO=512, CCOND=CFUSE
-- Pose dimension: DPOSE=28 (3 wrist xyz + 25D truncated proxy from flattened relative joints, matching the current data loader)
+- Pose dimension: DPOSE=51 (48D MANO pose parameters + 3D wrist translation, using OakInk's native representation)
 
 ## B. Training Implementation (Core Focus)
 
@@ -54,7 +54,7 @@ from models.functional_grasp_model import FunctionalGraspModel
 
 def train_functional_grasp(cfg):
     # Initialize model
-    model = FunctionalGraspModel(CSEM=256, CGEO=256, DPOSE=28)
+    model = FunctionalGraspModel(CSEM=256, CGEO=256, DPOSE=51)
     
     # Data loaders with OakInk
     train_loader, val_loader = create_oakink_loaders(
@@ -384,7 +384,7 @@ from .flow_matching import PoseFlow
 
 class FunctionalGraspModel(nn.Module):
     def __init__(self, qwen_name="Qwen/Qwen2.5-VL-3B-Instruct",
-                 CSEM=256, CGEO=256, DPOSE=28, K_CONTACT=1):
+                 CSEM=256, CGEO=256, DPOSE=51, K_CONTACT=1):
         super().__init__()
         self.sem = QwenSemanticsEncoder(model_name=qwen_name, csem_proj=CSEM)
         # PointNet++ via PyTorch Geometric (required)
@@ -603,7 +603,7 @@ from grasp.models.functional_grasp_model import FunctionalGraspModel
 from PIL import Image
 
 # Quick smoke test
-model = FunctionalGraspModel(DPOSE=28)
+model = FunctionalGraspModel(DPOSE=51)
 dummy_images = [Image.open("example.jpg")] * 2
 dummy_texts = ["grasp the bottle to pour water"] * 2
 dummy_pts = torch.randn(2, 1024, 3)

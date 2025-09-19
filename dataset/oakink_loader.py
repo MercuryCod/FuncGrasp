@@ -8,49 +8,55 @@ from PIL import Image
 from typing import List, Dict, Tuple, Optional
 import trimesh
 from pathlib import Path
+from torch_geometric.nn import fps
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class OakInkDataset(Dataset):
     """
     OakInk dataset loader for functional grasp training.
-    Loads multi-view images, hand poses, object meshes, and computes contact maps.
+    Loads rendered object images, hand poses, object meshes, and computes contact maps.
+    Uses 21-joint representation (63D flattened) for direct joint prediction.
     """
     
-    VIEWS = ["north_east", "south_east", "north_west", "south_west"]
-    HAND_JOINTS = 21  # MANO convention
+    # Standard views for rendered objects
+    OBJECT_VIEWS = ["front", "left", "right", "back", "top", "bottom"]
     
     def __init__(
         self,
         root_dir: str,
+        render_dir: str,
         split: str = "train",
         split_mode: str = "split0",
         n_points: int = 1024,
         contact_threshold: float = 0.01,  # 1cm threshold for contact
         use_cache: bool = True,
-        single_view: bool = True,
-        view_idx: int = 0,
-        semantic_prompts: Optional[Dict] = None
+        num_views: int = 3,  # Number of object views to use
+        semantic_prompts: Optional[Dict] = None,
+        transform_to_object_frame: bool = True
     ):
         """
         Args:
             root_dir: Path to OakInk dataset root
+            render_dir: Path to directory with rendered object images
             split: 'train' or 'test'
             split_mode: 'split0', 'split0_ho', 'split1', or 'split2'
             n_points: Number of points to sample from object mesh
             contact_threshold: Distance threshold for contact detection (meters)
             use_cache: Whether to cache processed data
-            single_view: Use single view or multi-view
-            view_idx: Which view to use if single_view
+            num_views: Number of object views to use (1-6)
             semantic_prompts: Dict mapping object IDs to functional descriptions
         """
         self.root_dir = Path(root_dir)
+        self.render_dir = Path(render_dir)
         self.split = split
         self.n_points = n_points
         self.contact_threshold = contact_threshold
         self.use_cache = use_cache
-        self.single_view = single_view
-        self.view_idx = view_idx
+        self.num_views = min(num_views, len(self.OBJECT_VIEWS))
         self.semantic_prompts = semantic_prompts or {}
+        self.transform_to_object_frame = transform_to_object_frame
         
         # Load split sequences
         split_file = self.root_dir / "image" / "anno" / "split" / split_mode / f"seq_{split}.json"
@@ -74,11 +80,11 @@ class OakInkDataset(Dataset):
         """
         Returns:
             Dict containing:
-                - images: PIL Images or list of images
-                - texts: Functional description string
-                - points: Object point cloud (N, 3)
-                - contact_labels: Binary contact labels (N,)
-                - pose: Hand pose (wrist + joints)
+                - images_list: List[List[PIL.Image]] - Batch format with B=1
+                - texts_list: List[str] - Batch format with B=1
+                - points: Object point cloud [1, N, 3]
+                - contact_labels: Binary contact labels [1, N]
+                - pose: Hand pose 63D joint representation [1, 63]
                 - meta: Additional metadata
         """
         # Parse sequence info
@@ -86,6 +92,7 @@ class OakInkDataset(Dataset):
         seq_id, timestamp, frame_idx, view_idx = seq_info
         
         # Create frame identifier
+        # The frame_id format matches the hand_j file naming convention
         frame_id = f"{seq_id.replace('/', '__')}__{timestamp}__{frame_idx}__{view_idx}"
         
         # Check cache
@@ -95,41 +102,44 @@ class OakInkDataset(Dataset):
                 with open(cache_file, 'rb') as f:
                     return pickle.load(f)
         
-        # Load annotations
-        hand_joints = self._load_hand_joints(frame_id)
-        obj_transform = self._load_obj_transform(frame_id)
-        cam_intrinsic = self._load_cam_intrinsic(frame_id)
-        
-        # Load image(s)
-        images = self._load_images(seq_id, timestamp, frame_idx)
-        
         # Extract object ID from sequence
         obj_id = self._get_object_id(seq_id)
+        
+        # Load rendered object images
+        images = self._load_rendered_images(obj_id)
+        
+        # Load annotations
+        hand_joints = self._load_hand_joints(frame_id)  # (21, 3) in world coordinates
+        obj_transform = self._load_obj_transform(frame_id)
+        
+        # Transform hand joints to object frame if requested
+        if self.transform_to_object_frame:
+            hand_joints = self._transform_joints_to_object_frame(hand_joints, obj_transform)
         
         # Load and transform object mesh
         points = self._load_object_points(obj_id, obj_transform)
         
-        # Compute contact labels
+        # Compute contact labels using hand joints (expanded surface)
         contact_labels = self._compute_contact_labels(hand_joints, points)
         
         # Generate semantic prompt
         text = self._generate_prompt(obj_id, seq_id)
         
-        # Convert hand joints to pose representation
-        pose = self._joints_to_pose(hand_joints)
+        # Convert joints to 63D flattened representation
+        pose = hand_joints.flatten()  # (21, 3) -> (63,)
         
-        # Prepare output
+        # Prepare output in batch format for pipeline compatibility
         batch = {
-            "images": images,
-            "texts": text,
-            "points": torch.tensor(points, dtype=torch.float32),
-            "contact_labels": torch.tensor(contact_labels, dtype=torch.float32),
-            "pose": torch.tensor(pose, dtype=torch.float32),
+            "images_list": [images],  # List[List[PIL.Image]] with B=1
+            "texts_list": [text],     # List[str] with B=1
+            "points": torch.tensor(points, dtype=torch.float32).unsqueeze(0),  # [1, N, 3]
+            "contact_labels": torch.tensor(contact_labels, dtype=torch.float32).unsqueeze(0),  # [1, N]
+            "pose": torch.tensor(pose, dtype=torch.float32).unsqueeze(0),  # [1, 63]
             "meta": {
                 "seq_id": seq_id,
                 "frame_idx": frame_idx,
                 "obj_id": obj_id,
-                "cam_intrinsic": cam_intrinsic
+                "obj_transform": obj_transform
             }
         }
         
@@ -158,35 +168,64 @@ class OakInkDataset(Dataset):
         with open(path, 'rb') as f:
             return pickle.load(f)  # (3, 3)
     
-    def _load_images(self, seq_id: str, timestamp: str, frame_idx: int) -> List[Image.Image]:
-        """Load RGB images from specified views."""
+    def _load_rendered_images(self, obj_id: str) -> List[Image.Image]:
+        """Load rendered object images."""
         images = []
-        base_path = self.root_dir / "image" / "stream_release_v2" / seq_id / timestamp
+        obj_render_dir = self.render_dir / obj_id
         
-        if self.single_view:
-            view = self.VIEWS[self.view_idx]
-            img_path = base_path / f"{view}_color_{frame_idx}.png"
+        # Load specified number of views
+        for i, view in enumerate(self.OBJECT_VIEWS[:self.num_views]):
+            img_path = obj_render_dir / f"{view}.png"
             if img_path.exists():
                 images.append(Image.open(img_path).convert('RGB'))
-        else:
-            for view in self.VIEWS:
-                img_path = base_path / f"{view}_color_{frame_idx}.png"
-                if img_path.exists():
-                    images.append(Image.open(img_path).convert('RGB'))
+            else:
+                raise FileNotFoundError(f"Rendered image not found: {img_path}")
         
-        # Return single image if single view, else list
-        return images[0] if self.single_view and images else images
+        return images
+    
+    def _transform_joints_to_object_frame(self, joints: np.ndarray, obj_transform: np.ndarray) -> np.ndarray:
+        """Transform hand joints from world frame to object frame.
+        
+        Args:
+            joints: (21, 3) hand joints in world coordinates
+            obj_transform: (4, 4) object-to-world transformation matrix
+            
+        Returns:
+            joints_obj: (21, 3) hand joints in object coordinates
+        """
+        try:
+            # Compute inverse transformation (world-to-object)
+            obj_transform_inv = np.linalg.inv(obj_transform)
+            
+            # Transform joints
+            joints_homo = np.hstack([joints, np.ones((21, 1))])  # (21, 4)
+            joints_obj = (obj_transform_inv @ joints_homo.T).T[:, :3]
+            
+            return joints_obj
+        except np.linalg.LinAlgError:
+            # If inverse fails, return joints in world frame
+            print(f"Warning: Failed to invert object transform, using world coordinates")
+            return joints
     
     def _get_object_id(self, seq_id: str) -> str:
-        """Extract object ID from sequence ID."""
-        # Format: A{object_code}_{intent}_{seq}
-        # Example: A01001_0002_0000 -> object 01001
+        """Extract object ID from sequence ID and align with rendered folder names.
+
+        We render per-object folders using the mesh stem or shape dir name:
+          - image/obj:  AXXXXX → folder 'AXXXXX'
+          - shape/*:    e.g., 'bottle_s001' → folder 'bottle_s001'
+
+        For compatibility, prefer returning the leading token (e.g., 'AXXXXX'),
+        which directly matches the render_dir scheme when rendering from image/obj.
+        """
         parts = seq_id.split('_')
-        if parts[0].startswith('A'):
-            obj_code = parts[0][1:]  # Remove 'A' prefix
-            # Map to actual object ID if needed
-            return self._map_object_code(obj_code)
-        return parts[0]
+        token = parts[0] if parts else seq_id
+        # Common OakInk prefixes include A,S,Y,C,O followed by digits
+        if token and len(token) > 1 and token[0].isalpha() and token[1:].isdigit():
+            return token
+        # Fallback to original token or legacy mapping if provided
+        if token.startswith('A') and len(token) > 1:
+            return token
+        return token
     
     def _map_object_code(self, obj_code: str) -> str:
         """Map object code to actual object ID."""
@@ -201,11 +240,15 @@ class OakInkDataset(Dataset):
         return code_to_id.get(obj_code, f"object_{obj_code}")
     
     def _load_object_points(self, obj_id: str, transform: np.ndarray) -> np.ndarray:
-        """Load object mesh and sample points."""
-        # Try different mesh locations
+        """Load object mesh and sample points using FPS."""
+        # Try different mesh locations and formats
         mesh_paths = [
+            self.root_dir / "image" / "obj" / f"{obj_id}.obj",
+            self.root_dir / "image" / "obj" / f"{obj_id}.ply",  # Also try PLY format
             self.root_dir / "shape" / "OakInkObjectsV2" / obj_id / "align" / "model_align.obj",
+            self.root_dir / "shape" / "OakInkObjectsV2" / obj_id / "align" / "model_align.ply",
             self.root_dir / "shape" / "OakInkVirtualObjectsV2" / obj_id / "align" / "model_align.obj",
+            self.root_dir / "shape" / "OakInkVirtualObjectsV2" / obj_id / "align" / "model_align.ply",
         ]
         
         mesh = None
@@ -215,11 +258,18 @@ class OakInkDataset(Dataset):
                 break
         
         if mesh is None:
-            # Fallback: create dummy point cloud
-            points = np.random.randn(self.n_points, 3) * 0.1
+            raise FileNotFoundError(f"Object mesh not found for {obj_id}. Tried paths: {mesh_paths}")
         else:
-            # Sample points from mesh surface
-            points, _ = trimesh.sample.sample_surface_even(mesh, self.n_points)
+            # Sample more points initially for FPS
+            initial_points, _ = trimesh.sample.sample_surface(mesh, self.n_points * 10)
+            
+            # Convert to torch for FPS
+            points_torch = torch.tensor(initial_points, dtype=torch.float32)
+            batch = torch.zeros(len(points_torch), dtype=torch.long)
+            
+            # Apply FPS to get exactly n_points
+            fps_idx = fps(points_torch, batch, ratio=float(self.n_points) / len(points_torch))
+            points = points_torch[fps_idx].numpy()
             
             # Apply transformation to world coordinates
             points_homo = np.hstack([points, np.ones((len(points), 1))])
@@ -268,15 +318,8 @@ class OakInkDataset(Dataset):
         
         return np.array(expanded)
     
-    def _joints_to_pose(self, joints: np.ndarray) -> np.ndarray:
-        """Convert 3D joint positions to pose representation."""
-        # Simple representation: wrist position + relative joint positions
-        wrist = joints[0]
-        relative_joints = joints[1:] - wrist
-        
-        # Flatten to vector: [wrist_xyz, relative_joints_flat]
-        pose = np.concatenate([wrist, relative_joints.flatten()])
-        return pose[:28]  # Truncate to match DPOSE=28 from pipeline
+    
+    
     
     def _generate_prompt(self, obj_id: str, seq_id: str) -> str:
         """Generate functional description for the object."""
@@ -363,37 +406,66 @@ class OakInkPartDataset(OakInkDataset):
 
 def create_oakink_loaders(
     root_dir: str,
+    render_dir: str,
     batch_size: int = 8,
     num_workers: int = 4,
     split_mode: str = "split0",
+    use_part_dataset: bool = True,
     **dataset_kwargs
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """
     Create train and test data loaders for OakInk dataset.
     
+    Args:
+        root_dir: Path to OakInk dataset root
+        render_dir: Path to rendered object images
+        batch_size: Batch size for training
+        num_workers: Number of data loading workers
+        split_mode: Data split to use
+        use_part_dataset: Whether to use part-based semantic annotations
+        **dataset_kwargs: Additional arguments for dataset
+    
     Returns:
         train_loader, test_loader
     """
-    train_dataset = OakInkPartDataset(
+    dataset_class = OakInkPartDataset if use_part_dataset else OakInkDataset
+    
+    train_dataset = dataset_class(
         root_dir=root_dir,
+        render_dir=render_dir,
         split="train",
         split_mode=split_mode,
         **dataset_kwargs
     )
     
-    test_dataset = OakInkPartDataset(
+    test_dataset = dataset_class(
         root_dir=root_dir,
+        render_dir=render_dir,
         split="test",
         split_mode=split_mode,
         **dataset_kwargs
     )
+    
+    # Custom collate function to handle our batch format
+    def collate_fn(batch_list):
+        """Collate function that maintains List[List[PIL.Image]] format."""
+        batch = {
+            'images_list': [item['images_list'][0] for item in batch_list],
+            'texts_list': [item['texts_list'][0] for item in batch_list],
+            'points': torch.cat([item['points'] for item in batch_list], dim=0),
+            'contact_labels': torch.cat([item['contact_labels'] for item in batch_list], dim=0),
+            'pose': torch.cat([item['pose'] for item in batch_list], dim=0),
+            'meta': [item['meta'] for item in batch_list]
+        }
+        return batch
     
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=collate_fn
     )
     
     test_loader = torch.utils.data.DataLoader(
@@ -401,7 +473,8 @@ def create_oakink_loaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=collate_fn
     )
     
     return train_loader, test_loader

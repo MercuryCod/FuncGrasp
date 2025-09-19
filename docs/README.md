@@ -42,6 +42,8 @@ This directory contains the technical documentation for the FuncGrasp project.
 
 6. **[pointnet2.md](pointnet2.md)** - PointNet++ Geometry Encoder
 
+7. **[oakink.md](oakink.md)** - OakInk Dataset Documentation
+
 ## Recent Updates
 
 - Qwen2.5‑VL (3B) is always trainable; the semantics encoder returns hidden states `[B, L_max, 2048]` for single text with multiple images. Pooling/projection to `CSEM` happens inside `FunctionalGraspModel`.

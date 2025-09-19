@@ -13,12 +13,10 @@ class Config:
     
     # Model architecture
     MODEL = {
-        'qwen_name': 'Qwen/Qwen2.5-VL-3B-Instruct',
-        'freeze_qwen': True,  # Set False to fine-tune Qwen backbone
         'CSEM': 256,      # Semantic feature dimension
         'CGEO': 256,      # Geometric feature dimension
         # CFUSE = CSEM + CGEO = 512 (automatically computed in model)
-        'DPOSE': 28,      # Pose dimension (3 wrist + 25 joints)
+        'DPOSE': 63,      # Pose dimension (21 joints × 3 coordinates)
         'K_CONTACT': 1,   # Contact classes (binary)
         'n_points': 1024, # Points per object
     }
@@ -26,8 +24,7 @@ class Config:
     # Training parameters
     TRAINING = {
         'batch_size': 4 if torch.cuda.is_available() else 2,
-        'learning_rate': 1e-4,  # For new layers
-        'backbone_lr': 1e-5,    # For Qwen backbone (if unfrozen)
+        'learning_rate': 1e-4,
         'weight_decay': 0.05,
         'epochs': 100,
         'gradient_clip': 1.0,
@@ -35,17 +32,17 @@ class Config:
         'lambda_flow': 1.0,     # Flow matching loss weight
         'log_interval': 10,     # Log every N batches
         'checkpoint_interval': 500,  # Save checkpoint every N batches
-        'gradient_accumulation': 1,  # Increase if unfreezing Qwen
+        'gradient_accumulation': 1,
     }
     
     # Data parameters
     DATA = {
-        'root_dir': os.environ.get('OAKINK_PATH', '/Users/mercury/Developer/FuncGrasp/OakInk'),
+        'root_dir': os.environ.get('OAKINK_PATH', '/DATA/disk0/OakInk'),
+        'render_dir': os.environ.get('OAKINK_RENDER_DIR', '/DATA/disk0/OakInk/rendered_objects'),
         'split_mode': 'split0',  # Object-based split
         'contact_threshold': 0.01,  # 1cm for contact approximation
         'use_cache': True,
         'single_view': True,  # Use single view for efficiency
-        'view_idx': 0,  # Which view to use (0-3)
     }
     
     # CPU/GPU settings
@@ -55,22 +52,13 @@ class Config:
     
     # CPU-specific settings
     CPU_CONFIG = {
-        'batch_size': 2,
+        'batch_size': 1,
         'num_workers': 0,
         'n_points': 512,  # Reduce for CPU
         'gradient_accumulation': 4,  # Simulate larger batches
         'checkpoint_freq': 100,
     }
     
-    # Fine-tuning specific settings (when freeze_qwen=False)
-    FINETUNE_CONFIG = {
-        'batch_size': 1,  # Very small batch for 3B model
-        'gradient_accumulation': 8,  # Effective batch = 8
-        'backbone_lr': 1e-5,  # Lower LR for pretrained weights
-        'head_lr': 1e-4,  # Higher LR for new layers
-        'use_fp16': True,  # Mixed precision essential
-        'gradient_checkpointing': True,  # Save memory
-    }
     
     # Flow matching parameters
     FLOW = {
@@ -86,13 +74,6 @@ class Config:
         'output_dir': './outputs',
     }
     
-    # Qwen processor settings
-    QWEN = {
-        'min_pixels': 256 * 28 * 28,
-        'max_pixels': 1024 * 28 * 28,
-        'device_map': 'auto',
-        'dtype': torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-    }
     
     # Evaluation settings
     EVAL = {
@@ -121,7 +102,6 @@ class Config:
             'fp16': cls.FP16,
             'flow': copy.deepcopy(cls.FLOW),
             'paths': copy.deepcopy(cls.PATHS),
-            'qwen': copy.deepcopy(cls.QWEN),
             'eval': copy.deepcopy(cls.EVAL),
         }
         

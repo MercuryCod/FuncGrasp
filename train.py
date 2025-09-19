@@ -13,26 +13,24 @@ from tqdm import tqdm
 import numpy as np
 
 # Optional tensorboard import
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    HAS_TENSORBOARD = True
-except ImportError:
-    HAS_TENSORBOARD = False
-    print("Warning: TensorBoard not installed. Logging will be disabled.")
+from torch.utils.tensorboard import SummaryWriter
+HAS_TENSORBOARD = True
+
 
 from models.functional_grasp_model import FunctionalGraspModel
 from config import Config
-from data.oakink_loader import create_oakink_loaders
+from dataset.oakink_loader import create_oakink_loaders
 
 
-def compute_flow_matching_loss(model, conditioning, target_pose):
+def compute_flow_matching_loss(model, conditioning, target_pose, bone_length_reg=0.0):
     """
     Compute rectified flow matching loss.
     
     Args:
         model: FunctionalGraspModel
         conditioning: [B, CCOND] conditioning vector
-        target_pose: [B, DPOSE] target grasp poses
+        target_pose: [B, DPOSE] target grasp poses (flattened 21×3 joints)
+        bone_length_reg: Weight for bone length regularization (optional)
     
     Returns:
         loss: Flow matching loss
@@ -53,7 +51,54 @@ def compute_flow_matching_loss(model, conditioning, target_pose):
     # Target velocity (constant for rectified flow)
     v_target = target_pose - x0
     
-    return F.mse_loss(v_pred, v_target)
+    # Main flow matching loss
+    loss = F.mse_loss(v_pred, v_target)
+    
+    # Optional bone length regularization for joint representation
+    if bone_length_reg > 0 and target_pose.shape[1] == 63:
+        # Reshape to joints: [B, 21, 3]
+        joints_pred = (x_t + t.unsqueeze(-1) * v_pred).reshape(B, 21, 3)
+        
+        # Define hand bone connections (parent -> child)
+        # Based on standard hand skeleton
+        bone_connections = [
+            # Thumb
+            (0, 1), (1, 2), (2, 3), (3, 4),
+            # Index finger  
+            (0, 5), (5, 6), (6, 7), (7, 8),
+            # Middle finger
+            (0, 9), (9, 10), (10, 11), (11, 12),
+            # Ring finger
+            (0, 13), (13, 14), (14, 15), (15, 16),
+            # Little finger
+            (0, 17), (17, 18), (18, 19), (19, 20)
+        ]
+        
+        # Expected bone lengths (in meters, approximate for adult hand)
+        # These should be computed from training data statistics
+        expected_lengths = torch.tensor([
+            # Thumb bones
+            0.050, 0.035, 0.025, 0.020,
+            # Index finger
+            0.080, 0.045, 0.030, 0.020,
+            # Middle finger
+            0.085, 0.050, 0.035, 0.025,
+            # Ring finger
+            0.080, 0.045, 0.030, 0.025,
+            # Little finger
+            0.070, 0.035, 0.025, 0.020
+        ], device=device)
+        
+        # Compute bone length regularization
+        bone_loss = 0.0
+        for i, (parent, child) in enumerate(bone_connections):
+            bone_vec = joints_pred[:, child] - joints_pred[:, parent]
+            bone_len = torch.norm(bone_vec, dim=1)
+            bone_loss += F.mse_loss(bone_len, expected_lengths[i].expand(B))
+        
+        loss = loss + bone_length_reg * bone_loss / len(bone_connections)
+    
+    return loss
 
 
 def train_one_epoch(model, loader, optimizer, cfg, device, writer, global_step):
@@ -91,8 +136,8 @@ def train_one_epoch(model, loader, optimizer, cfg, device, writer, global_step):
         
         # Forward pass
         out = model.forward_train(
-            images=batch["images"],
-            texts=batch["texts"],
+            images_list=batch["images_list"],
+            texts_list=batch["texts_list"],
             pts=pts
         )
         
@@ -149,7 +194,7 @@ def train_one_epoch(model, loader, optimizer, cfg, device, writer, global_step):
             })
         
         # Checkpoint saving
-        if global_step % cfg['training']['checkpoint_interval'] == 0:
+        if global_step > 0 and global_step % cfg['training']['checkpoint_interval'] == 0:
             save_checkpoint(model, optimizer, global_step, cfg)
         
         global_step += 1
@@ -189,8 +234,8 @@ def validate(model, loader, cfg, device, writer, global_step):
             
             # Forward pass
             out = model.forward_train(
-                images=batch["images"],
-                texts=batch["texts"],
+                images_list=batch["images_list"],
+                texts_list=batch["texts_list"],
                 pts=pts
             )
             
@@ -291,22 +336,23 @@ def main():
     
     # Data loaders
     print("Loading data...")
+    # Map single_view/view_idx to num_views used by the dataset
+    num_views = 1 if cfg['data'].get('single_view', True) else 6
     train_loader, val_loader = create_oakink_loaders(
         root_dir=cfg['data']['root_dir'],
+        render_dir=cfg['data'].get('render_dir', './rendered_objects'),
         batch_size=cfg['training']['batch_size'],
         num_workers=cfg['num_workers'],
         split_mode=cfg['data']['split_mode'],
         n_points=cfg['model']['n_points'],
         contact_threshold=cfg['data']['contact_threshold'],
-        single_view=cfg['data']['single_view'],
+        num_views=num_views,
         use_cache=cfg['data']['use_cache']
     )
     
     # Model
     print("Initializing model...")
     model = FunctionalGraspModel(
-        qwen_name=cfg['model']['qwen_name'],
-        freeze_qwen=cfg['model'].get('freeze_qwen', True),
         CSEM=cfg['model']['CSEM'],
         CGEO=cfg['model']['CGEO'],
         DPOSE=cfg['model']['DPOSE'],
@@ -319,39 +365,13 @@ def main():
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     
-    # Optimizer with differential learning rates
-    if not cfg['model'].get('freeze_qwen', True):
-        # Separate parameter groups for backbone and head
-        backbone_params = []
-        head_params = []
-        
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                if 'sem.backbone' in name:
-                    backbone_params.append(param)
-                else:
-                    head_params.append(param)
-        
-        optimizer_groups = [
-            {'params': backbone_params, 'lr': cfg['training'].get('backbone_lr', 1e-5)},
-            {'params': head_params, 'lr': cfg['training']['learning_rate']}
-        ]
-        
-        print(f"Backbone params: {sum(p.numel() for p in backbone_params):,}")
-        print(f"Head params: {sum(p.numel() for p in head_params):,}")
-        
-        optimizer = AdamW(
-            optimizer_groups,
-            weight_decay=cfg['training']['weight_decay']
-        )
-    else:
-        # Standard optimizer for frozen backbone
-        trainable_params_list = [p for p in model.parameters() if p.requires_grad]
-        optimizer = AdamW(
-            trainable_params_list,
-            lr=cfg['training']['learning_rate'],
-            weight_decay=cfg['training']['weight_decay']
-        )
+    # Optimizer
+    trainable_params_list = [p for p in model.parameters() if p.requires_grad]
+    optimizer = AdamW(
+        trainable_params_list,
+        lr=cfg['training']['learning_rate'],
+        weight_decay=cfg['training']['weight_decay']
+    )
     
     # Load checkpoint if provided
     global_step = 0

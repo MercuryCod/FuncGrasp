@@ -33,14 +33,14 @@ class FunctionalGraspModel(nn.Module):
         self,
         CSEM: int = 256,
         CGEO: int = 256,
-        DPOSE: int = 28,
+        DPOSE: int = 63,
         K_CONTACT: int = 1
     ):
         """
         Args:
             CSEM: Semantic feature dimension
             CGEO: Geometric feature dimension
-            DPOSE: Pose dimension (wrist + joints)
+            DPOSE: Pose dimension (21 joints × 3 coordinates = 63)
             K_CONTACT: Number of contact classes
         """
         super().__init__()
@@ -105,12 +105,10 @@ class FunctionalGraspModel(nn.Module):
         else:
             pooled = H.mean(dim=1)  # [B, Dq]
         
-        # Ensure sem_proj is on the same device as pooled and convert to float32
-        device = pooled.device
-        self.sem_proj = self.sem_proj.to(device)
-        
-        # Convert to float32 for compatibility with linear layers
+        # Convert to float32 and move to model device for compatibility
         pooled = pooled.float()
+        device = next(self.sem_proj.parameters()).device
+        pooled = pooled.to(device)
         
         s = self.sem_proj(pooled)  # [B, CSEM]
         
