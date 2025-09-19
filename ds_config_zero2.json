@@ -1,0 +1,77 @@
+{
+  "train_batch_size": 32,
+  "train_micro_batch_size_per_gpu": 4,
+  "gradient_accumulation_steps": 1,
+  "steps_per_print": 10,
+  "gradient_clipping": 1.0,
+
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": 1e-4,
+      "betas": [0.9, 0.999],
+      "eps": 1e-8,
+      "weight_decay": 0.05
+    }
+  },
+
+  "scheduler": {
+    "type": "WarmupDecayLR",
+    "params": {
+      "warmup_min_lr": 1e-6,
+      "warmup_max_lr": 1e-4,
+      "warmup_num_steps": 500,
+      "total_num_steps": 10000
+    }
+  },
+
+  "fp16": {
+    "enabled": false
+  },
+
+  "bf16": {
+    "enabled": true
+  },
+
+  "zero_optimization": {
+    "stage": 2,
+    "offload_optimizer": {
+      "device": "none"
+    },
+    "allgather_partitions": true,
+    "allgather_bucket_size": 5e8,
+    "overlap_comm": true,
+    "reduce_scatter": true,
+    "reduce_bucket_size": 5e8,
+    "contiguous_gradients": true,
+    "round_robin_gradients": true
+  },
+
+  "activation_checkpointing": {
+    "partition_activations": false,
+    "cpu_checkpointing": false,
+    "contiguous_memory_optimization": false,
+    "number_checkpoints": null,
+    "synchronize_checkpoint_boundary": false,
+    "profile": false
+  },
+
+  "wall_clock_breakdown": false,
+  "tensorboard": {
+    "enabled": true,
+    "output_path": "./logs/deepspeed",
+    "job_name": "funcgrasp_training"
+  },
+
+  "comms_logger": {
+    "enabled": false,
+    "verbose": false,
+    "prof_all": false,
+    "debug": false
+  },
+
+  "checkpoint": {
+    "tag_validation": "ignore",
+    "load_universal": true
+  }
+}

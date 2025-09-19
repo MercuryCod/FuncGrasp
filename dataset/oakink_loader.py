@@ -426,7 +426,11 @@ def create_oakink_loaders(
         num_workers: Number of data loading workers
         split_mode: Data split to use
         use_part_dataset: Whether to use part-based semantic annotations
+<<<<<<< Updated upstream
         distributed: Whether to use DistributedSampler for FSDP
+=======
+        distributed: Whether to use DistributedSampler
+>>>>>>> Stashed changes
         world_size: Number of distributed processes
         rank: Current process rank
         **dataset_kwargs: Additional arguments for dataset
@@ -464,7 +468,11 @@ def create_oakink_loaders(
             'meta': [item['meta'] for item in batch_list]
         }
         return batch
+<<<<<<< Updated upstream
 
+=======
+    
+>>>>>>> Stashed changes
     # Create samplers for distributed training
     if distributed:
         from torch.utils.data.distributed import DistributedSampler
