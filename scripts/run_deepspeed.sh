@@ -5,8 +5,8 @@
 set -e  # Exit on error
 
 # Default values
-DATA_PATH="${OAKINK_PATH:-/DATA/disk0/OakInk}"
-RENDER_PATH="${OAKINK_RENDER_DIR:-/DATA/disk0/OakInk/rendered_objects}"
+DATA_PATH="${OAKINK_PATH:-/DATA/disk1/changma/OakInk}"
+RENDER_PATH="${OAKINK_RENDER_DIR:-/DATA/disk1/changma/OakInk/rendered_objects}"
 BATCH_SIZE=${BATCH_SIZE:-4}
 EPOCHS=${EPOCHS:-100}
 NUM_NODES=${NUM_NODES:-1}

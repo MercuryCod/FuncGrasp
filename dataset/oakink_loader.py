@@ -426,11 +426,7 @@ def create_oakink_loaders(
         num_workers: Number of data loading workers
         split_mode: Data split to use
         use_part_dataset: Whether to use part-based semantic annotations
-<<<<<<< Updated upstream
         distributed: Whether to use DistributedSampler for FSDP
-=======
-        distributed: Whether to use DistributedSampler
->>>>>>> Stashed changes
         world_size: Number of distributed processes
         rank: Current process rank
         **dataset_kwargs: Additional arguments for dataset
@@ -468,52 +464,4 @@ def create_oakink_loaders(
             'meta': [item['meta'] for item in batch_list]
         }
         return batch
-<<<<<<< Updated upstream
 
-=======
-    
->>>>>>> Stashed changes
-    # Create samplers for distributed training
-    if distributed:
-        from torch.utils.data.distributed import DistributedSampler
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            drop_last=True
-        )
-        test_sampler = DistributedSampler(
-            test_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=False,
-            drop_last=False
-        )
-    else:
-        train_sampler = None
-        test_sampler = None
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=(train_sampler is None),  # Only shuffle if not using sampler
-        sampler=train_sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-        drop_last=True if distributed else False
-    )
-
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        sampler=test_sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-        drop_last=False
-    )
-
-    return train_loader, test_loader
