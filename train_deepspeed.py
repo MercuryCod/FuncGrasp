@@ -303,10 +303,8 @@ def main():
     # DeepSpeed arguments
     parser.add_argument('--local_rank', type=int, default=-1,
                         help='Local rank for distributed training')
-    parser.add_argument('--deepspeed_config', type=str, default='ds_config_zero2.json',
-                        help='DeepSpeed configuration file')
 
-    # Include DeepSpeed's argument parser
+    # Include DeepSpeed's argument parser (this adds --deepspeed_config among other args)
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
 
