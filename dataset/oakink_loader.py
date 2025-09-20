@@ -465,3 +465,46 @@ def create_oakink_loaders(
         }
         return batch
 
+    # Create samplers for distributed training if needed
+    if distributed:
+        from torch.utils.data.distributed import DistributedSampler
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True
+        )
+        test_sampler = DistributedSampler(
+            test_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False
+        )
+    else:
+        train_sampler = None
+        test_sampler = None
+
+    # Create data loaders
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        drop_last=True
+    )
+
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=test_sampler,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        drop_last=False
+    )
+
+    return train_loader, test_loader
