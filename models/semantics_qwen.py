@@ -11,7 +11,7 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from qwen_vl_utils import process_vision_info
 
 
-MODEL_PATH = "/root/models"
+MODEL_PATH = "/root/FuncGrasp/"
 
 class QwenSemanticsEncoder(nn.Module):
     """
