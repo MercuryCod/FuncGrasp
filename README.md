@@ -13,7 +13,7 @@ FuncGrasp/
 │   ├── fusion_transformer.py      # Transformer for multimodal fusion
 │   ├── contact_head.py            # 7-way contact prediction head
 │   └── flow_matching.py           # Conditional flow matching for poses
-├── data/                 # Data loaders and utilities
+├── dataset/              # Data loaders and utilities
 │   ├── oakink_loader.py           # OakInk dataset loader
 │   └── prepare_data.py            # Object rendering utilities
 ├── docs/                 # Documentation
@@ -21,7 +21,7 @@ FuncGrasp/
 │   └── dataset.md                 # Dataset documentation
 ├── config.py             # Training configuration
 ├── train.py              # Main training script
-└── test_pipeline.py      # Testing script
+└── scripts/              # Helper scripts
 ```
 
 ## Quick Start

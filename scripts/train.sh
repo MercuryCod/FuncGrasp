@@ -2,21 +2,24 @@
 # Training script for FuncGrasp with OakInk dataset
 
 # Activate conda environment
-source ~/miniconda/etc/profile.d/conda.sh
+source ~/miniconda3/etc/profile.d/conda.sh
 conda activate grasp
 
-# Set environment variables (optional overrides)
-# export OAKINK_PATH=/DATA/disk0/OakInk
-# export OAKINK_RENDER_DIR=/DATA/disk0/OakInk/rendered_objects
+data_path="/mnt/data/changma/OakInk"
 
-# Training command
-if [ "$1" == "test" ]; then
-    echo "Running test mode - checking data loading..."
-    python test_data_loading.py
-elif [ "$1" == "cpu" ]; then
-    echo "Running CPU training..."
-    python train.py --device cpu --batch_size 2 --epochs 5
-else
-    echo "Running GPU training..."
-    python train.py --epochs 100
-fi
+# Automatically set environment variables based on data_path
+export OAKINK_PATH=$data_path
+export OAKINK_RENDER_DIR=$data_path/rendered_objects
+
+echo "Using OakInk data path: $OAKINK_PATH"
+echo "Using rendered objects path: $OAKINK_RENDER_DIR"
+
+# Frozen mode (default)
+# python train.py --data_path $data_path
+
+# # Full fine-tuning
+# python train.py --data_path $data_path --qwen_tuning full
+
+# # LoRA fine-tuning
+python train.py --data_path $data_path --qwen_tuning lora --lora_r 16 --lora_alpha 32
+

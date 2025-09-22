@@ -296,9 +296,18 @@ def save_checkpoint(model, optimizer, step, cfg):
     )
     torch.save(checkpoint, path)
     print(f"Saved checkpoint to {path}")
+    
+    # Save LoRA adapters separately if using LoRA
+    if cfg['model'].get('qwen_tuning') == 'lora':
+        lora_path = os.path.join(
+            cfg['paths']['checkpoint_dir'],
+            f'lora_adapters_step_{step}'
+        )
+        model.sem.save_lora_weights(lora_path)
 
 
 def main():
+    
     parser = argparse.ArgumentParser(description="Train functional grasp model")
     parser.add_argument('--data_path', type=str, default=None,
                         help='Path to OakInk dataset')
@@ -310,6 +319,24 @@ def main():
                         help='Device (cuda/cpu)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to checkpoint to resume from')
+    
+    # LoRA-specific arguments
+    parser.add_argument('--qwen_tuning', type=str, default=None,
+                        choices=['frozen', 'full', 'lora'],
+                        help='Qwen tuning mode (default: frozen)')
+    parser.add_argument('--lora_r', type=int, default=None,
+                        help='LoRA rank (default: 16)')
+    parser.add_argument('--lora_alpha', type=int, default=None,
+                        help='LoRA alpha (default: 32)')
+    parser.add_argument('--lora_dropout', type=float, default=None,
+                        help='LoRA dropout (default: 0.05)')
+    parser.add_argument('--lora_targets', type=str, default=None,
+                        help='Comma-separated LoRA target modules (default: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj)')
+    parser.add_argument('--lora_bias', type=str, default=None,
+                        choices=['none', 'all', 'lora_only'],
+                        help='LoRA bias mode (default: none)')
+    parser.add_argument('--lora_use_8bit', action='store_true',
+                        help='Use 8-bit base model with LoRA (requires bitsandbytes)')
     
     args = parser.parse_args()
     
@@ -325,6 +352,28 @@ def main():
         cfg['training']['epochs'] = args.epochs
     if args.device:
         cfg['device'] = args.device
+    
+    # Override LoRA settings
+    if args.qwen_tuning:
+        cfg['model']['qwen_tuning'] = args.qwen_tuning
+    if args.lora_r is not None:
+        cfg['lora']['r'] = args.lora_r
+    if args.lora_alpha is not None:
+        cfg['lora']['alpha'] = args.lora_alpha
+    if args.lora_dropout is not None:
+        cfg['lora']['dropout'] = args.lora_dropout
+    if args.lora_targets:
+        cfg['lora']['target_modules'] = args.lora_targets.split(',')
+    if args.lora_bias:
+        cfg['lora']['bias'] = args.lora_bias
+    if args.lora_use_8bit:
+        cfg['lora']['use_8bit'] = True
+    
+    # Display tuning mode
+    print(f"Qwen tuning mode: {cfg['model']['qwen_tuning']}")
+    if cfg['model']['qwen_tuning'] == 'lora':
+        print(f"LoRA config: r={cfg['lora']['r']}, alpha={cfg['lora']['alpha']}, dropout={cfg['lora']['dropout']}")
+        print(f"LoRA targets: {cfg['lora']['target_modules']}")
     
     # Create directories
     Config.create_dirs()
@@ -355,7 +404,9 @@ def main():
         CSEM=cfg['model']['CSEM'],
         CGEO=cfg['model']['CGEO'],
         DPOSE=cfg['model']['DPOSE'],
-        K_CONTACT=cfg['model']['K_CONTACT']
+        K_CONTACT=cfg['model']['K_CONTACT'],
+        qwen_tuning=cfg['model']['qwen_tuning'],
+        lora_cfg=cfg['lora'] if cfg['model']['qwen_tuning'] == 'lora' else None
     ).to(device)
     
     # Count parameters
@@ -378,10 +429,30 @@ def main():
     if args.checkpoint:
         print(f"Loading checkpoint from {args.checkpoint}")
         checkpoint = torch.load(args.checkpoint, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Handle LoRA adapter loading if needed
+        if cfg['model']['qwen_tuning'] == 'lora' and 'lora_state_dict' in checkpoint:
+            # For LoRA, we need special handling
+            # Load non-LoRA parameters normally
+            model_state = checkpoint['model_state_dict']
+            model.load_state_dict(model_state, strict=False)
+            # LoRA adapters are loaded as part of the model state
+        else:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         global_step = checkpoint['step']
         start_epoch = global_step // len(train_loader)
+        
+        # Try to load LoRA adapters from separate file if exists
+        if cfg['model']['qwen_tuning'] == 'lora':
+            lora_path = os.path.join(
+                os.path.dirname(args.checkpoint),
+                f'lora_adapters_step_{global_step}'
+            )
+            if os.path.exists(lora_path):
+                print(f"Loading LoRA adapters from {lora_path}")
+                # Note: actual loading handled by PEFT through model state dict
     
     # TensorBoard writer
     writer = SummaryWriter(cfg['paths']['log_dir'])

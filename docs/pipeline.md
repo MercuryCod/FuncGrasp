@@ -186,20 +186,19 @@ FuncGrasp/
 │   ├── contact_head.py            # Contact prediction
 │   ├── flow_matching.py           # Pose generation
 │   └── functional_grasp_model.py  # Full model
-├── data/
+├── dataset/
 │   ├── oakink_loader.py           # OakInk dataset loader
-│   └── prepare_oakink.py          # Data utilities
+│   └── prepare_data.py            # Object rendering utilities
 ├── docs/
 │   ├── pipeline.md
 │   └── dataset.md
 ├── config.py                       # Configuration
 ├── train.py                        # Training script
-└── test_pipeline.py                # Tests
 ```
 
 ## E. Model Architecture Components
 
-### E.1 Qwen2.5-VL Semantics Encoder (Trainable by default)
+### E.1 Qwen2.5-VL Semantics Encoder
 
 ```python
 # models/semantics_qwen.py
@@ -209,58 +208,10 @@ from qwen_vl_utils import process_vision_info
 
 class QwenSemanticsEncoder(nn.Module):
     """
-    Wraps Qwen2.5-VL to produce a pooled multimodal embedding s ∈ ℝ^{B×CSEM}.
-    Backbone is trainable by default; set freeze_backbone=True to freeze.
+    Wraps Qwen2.5-VL and returns token hidden states H ∈ ℝ^{B×L_max×2048} and attention_mask.
+    Masked pooling and projection to s ∈ ℝ^{B×CSEM} are performed inside FunctionalGraspModel.
     """
-    def __init__(self, model_name="Qwen/Qwen2.5-VL-3B-Instruct",
-                 csem_proj=256, freeze_backbone=False,
-                 min_pixels=None, max_pixels=None, 
-                 device_map="auto", dtype=torch.bfloat16):
-        super().__init__()
-        self.processor = AutoProcessor.from_pretrained(
-            model_name, min_pixels=min_pixels, max_pixels=max_pixels
-        )
-        # Use the *backbone* (no LM head) to access hidden states
-        self.backbone = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_name, torch_dtype=dtype, device_map=device_map
-        )
-        # Train or freeze Qwen parameters
-        if freeze_backbone:
-            for p in self.backbone.parameters():
-                p.requires_grad_(False)
-        else:
-            # Enable gradient checkpointing for memory efficiency
-            self.backbone.gradient_checkpointing_enable()
-        hidden = self.backbone.config.hidden_size  # 2048
-        self.proj = nn.Sequential(
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, csem_proj)
-        )
-
-    def _pack(self, images, texts):
-        # images: list of PIL.Image; texts: list[str]
-        messages = [{"role":"user","content":[
-            {"type":"image","image":im},
-            {"type":"text","text":tx}]} 
-            for im,tx in zip(images, texts)]
-        text_inputs = [self.processor.apply_chat_template(m, tokenize=False, 
-                       add_generation_prompt=False) for m in messages]
-        image_inputs, video_inputs = zip(*[process_vision_info(m) for m in messages])
-        proc = self.processor(
-            text=text_inputs, images=list(image_inputs), videos=list(video_inputs),
-            padding=True, return_tensors="pt"
-        )
-        return proc
-
-    def forward(self, images, texts):
-        """images: List[image]; texts: List[str]; returns s [B, Csem_proj]"""
-        inputs = self._pack(images, texts).to(next(self.proj.parameters()).device)
-        out = self.backbone(**inputs, output_hidden_states=False, return_dict=True)
-        # Masked mean pool over tokens → s ∈ ℝ^{B×CSEM}
-        mask = inputs.attention_mask.float().unsqueeze(-1)
-        pooled = (out.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1e-6)
-        s = self.proj(pooled)
-        return s
+    # See models/semantics_qwen.py in the repo for the exact implementation
 ```
 
 ### E.2 PointNet++ Encoder
@@ -559,19 +510,25 @@ tensorboard --logdir ./logs
 ### I.1 Evaluation Metrics
 
 ```python
-def evaluate_grasp(pred_pose, gt_pose, point_cloud, contact_labels):
+def evaluate_grasp(model, images, text, pts, gt_pose, gt_contact_labels):
     """Compute evaluation metrics"""
     metrics = {}
     
-    # Pose accuracy (joint angles)
-    metrics['pose_error'] = F.mse_loss(pred_pose, gt_pose).item()
+    # Pose error (MSE)
+    with torch.no_grad():
+        _, _, cond = model.forward_backbone([images], [text], pts.unsqueeze(0))
+        # Sample a pose via flow matching sampler (or do teacher-forced one-step for speed)
+        pred_pose = model.sample([images], [text], pts.unsqueeze(0), num_steps=20, device=pts.device)
+    metrics['pose_error'] = F.mse_loss(pred_pose, gt_pose.unsqueeze(0)).item()
     
-    # Contact prediction accuracy
-    pred_contacts = model.predict_contacts(pred_pose, point_cloud)
-    metrics['contact_iou'] = compute_iou(pred_contacts, contact_labels)
+    # Contact prediction IoU
+    with torch.no_grad():
+        _, logits_c, _ = model.forward_backbone([images], [text], pts.unsqueeze(0))
+        pred_contacts = logits_c.argmax(-1).squeeze(0)  # [N]
+    metrics['contact_iou'] = compute_iou(pred_contacts, gt_contact_labels)
     
-    # Functional success (task-specific)
-    metrics['grasp_stability'] = check_force_closure(pred_pose, point_cloud)
+    # Optional: functional success proxy
+    # metrics['grasp_stability'] = check_force_closure(pred_pose, pts)
     
     return metrics
 ```
@@ -645,30 +602,65 @@ The implementation follows the hand-drawn architecture sketches in `assets/`:
 
 > These are drop-in alternatives you can enable later without changing the baseline in this doc. They reflect designs we discussed as potentially better under some settings.
 
-### M.0 Fine-tuning Qwen2.5-VL Backbone
+### M.0 Qwen2.5-VL Backbone Tuning Modes
 
-- **What**: Allow gradients to flow through the Qwen backbone instead of freezing it.
-- **Why**: Adapt vision-language representations to your specific grasp domain; can improve task performance.
-- **How**:
-```python
-# In config.py
-MODEL = {
-    'freeze_qwen': False,  # Enable gradient flow
-}
-TRAINING = {
-    'learning_rate': 1e-4, # Higher LR for new layers
-    'batch_size': 1,       # Reduce for memory
-    'gradient_accumulation': 8,
-}
-```
+The pipeline supports three tuning modes for the Qwen backbone:
+
+#### 1. Frozen (Default)
+- **What**: Freeze entire Qwen backbone, only train new layers.
+- **Why**: Fast training, low memory, preserves pre-trained capabilities.
+- **How**: Set `qwen_tuning: 'frozen'` in config or `--qwen_tuning frozen`.
+- **Impact**: ~15.4M trainable params, works on consumer GPUs.
+
+#### 2. Full Fine-tuning
+- **What**: Allow gradients through entire Qwen backbone.
+- **Why**: Adapt vision-language representations to grasp domain.
+- **How**: Set `qwen_tuning: 'full'` in config or `--qwen_tuning full`.
 - **Impact**:
   - Trainable params: 15.4M → 3.77B
   - Memory: ~0.2GB → ~42GB
   - Requires 24GB+ GPU (A100, A6000, etc.)
 - **Tips**:
-  - Use gradient checkpointing (automatic when unfrozen)
+  - Use gradient checkpointing (automatic)
   - Mixed precision (fp16/bf16) essential
   - Monitor for catastrophic forgetting
+
+#### 3. LoRA (Low-Rank Adaptation)
+- **What**: Apply LoRA adapters to specific Qwen modules.
+- **Why**: Efficient fine-tuning with <1% trainable params.
+- **How**: 
+```bash
+python train.py --qwen_tuning lora --lora_r 16 --lora_alpha 32
+```
+- **Config**:
+```python
+MODEL = {
+    'qwen_tuning': 'lora',
+}
+LORA = {
+    'r': 16,                    # Rank
+    'alpha': 32,                # Scaling
+    'dropout': 0.05,
+    'target_modules': ['q_proj', 'k_proj', 'v_proj', 'o_proj',
+                      'gate_proj', 'up_proj', 'down_proj'],
+    'bias': 'none',
+    'use_8bit': False,          # Set True to use 8-bit base (saves memory)
+}
+```
+- **Impact**:
+  - Trainable params: ~15.4M + LoRA adapters (~0.1-1% of base)
+  - Memory: Similar to frozen + small overhead
+  - Works on consumer GPUs (16GB+)
+- **CLI Options**:
+  - `--lora_r`: LoRA rank (default: 16)
+  - `--lora_alpha`: LoRA alpha (default: 32)
+  - `--lora_dropout`: Dropout (default: 0.05)
+  - `--lora_targets`: Comma-separated target modules
+  - `--lora_bias`: Bias mode (none/all/lora_only)
+  - `--lora_use_8bit`: Use 8-bit base model
+- **Checkpoint Handling**:
+  - LoRA adapters saved separately in `lora_adapters_step_{N}/`
+  - Easy to swap adapters or revert to base model
 
 ### M.1 Plain mean pooling (ablation)
 

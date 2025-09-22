@@ -329,7 +329,7 @@ batch = {
    - Generate 6 standard views per object with consistent parameters
 
 2. **Update Data Loader**:
-   - Modify `data/oakink_loader.py` to use rendered images instead of interaction images
+   - Modify `dataset/oakink_loader.py` to use rendered images instead of interaction images
    - Implement point cloud sampling from the same meshes used for rendering
    - Ensure mesh-image-pointcloud alignment
 
@@ -377,8 +377,9 @@ def render_object_open3d(mesh_path, output_dir):
 - ✅ **Hand Poses**: 21 joints available and transformed to object frame (63D)
 - ✅ **Contact Labels**: 7-way finger/palm labels via MANO mesh proximity with 1cm threshold
 - ✅ **Object Images**: Rendered multi-view images implemented under `dataset/prepare_data.py`
+- ✅ **Loader Robustness**: During training, sequences with missing rendered images are filtered out to keep the pipeline running with partial renders.
 
-**Bottom Line**: With the rendering utility in place, the loader expects rendered views, 63D joint poses, and 7-way contact labels for training.
+**Bottom Line**: With the rendering utility in place, the loader expects rendered views, 63D joint poses, and 7-way contact labels for training. Missing renders are skipped during development-only training runs.
 
 ## Hand Pose Representation Analysis
 

@@ -39,7 +39,9 @@ class FunctionalGraspModel(nn.Module):
         CSEM: int = 256,
         CGEO: int = 256,
         DPOSE: int = 63,
-        K_CONTACT: int = 1
+        K_CONTACT: int = 7,
+        qwen_tuning: str = 'frozen',
+        lora_cfg: dict = None
     ):
         """
         Args:
@@ -47,12 +49,14 @@ class FunctionalGraspModel(nn.Module):
             CGEO: Geometric feature dimension
             DPOSE: Pose dimension (21 joints × 3 coordinates = 63)
             K_CONTACT: Number of contact classes
+            qwen_tuning: Tuning mode for Qwen ('frozen', 'full', 'lora')
+            lora_cfg: LoRA configuration dict (used when qwen_tuning='lora')
         """
         super().__init__()
         
         # Component models
         # Qwen2.5-VL encoder; returns last_hidden_state [B, L, Dq]
-        self.sem = QwenSemanticsEncoder()
+        self.sem = QwenSemanticsEncoder(tuning=qwen_tuning, lora_cfg=lora_cfg)
         # Pool + project semantic hidden states to CSEM for fusion using dynamic Dq
         dq = int(getattr(self.sem, 'hidden_size', 0) or 0)
         if dq <= 0:

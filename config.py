@@ -24,6 +24,20 @@ class Config:
         'DPOSE': 63,      # Pose dimension (21 joints × 3 coordinates)
         'K_CONTACT': 7,   # Contact classes (5 fingers + palm + no_contact)
         'n_points': 1024, # Points per object
+        'qwen_tuning': 'frozen',  # 'frozen', 'full', or 'lora'
+    }
+    
+    # LoRA configuration (only used when qwen_tuning='lora')
+    LORA = {
+        'r': 16,                    # LoRA rank
+        'alpha': 32,                # LoRA alpha (scaling factor)
+        'dropout': 0.05,            # LoRA dropout
+        'target_modules': [         # Which modules to apply LoRA to
+            'q_proj', 'k_proj', 'v_proj', 'o_proj',
+            'gate_proj', 'up_proj', 'down_proj'
+        ],
+        'bias': 'none',             # 'none', 'all', or 'lora_only'
+        'use_8bit': False,          # Whether to use 8-bit base model (requires bitsandbytes)
     }
     
     # Training parameters
@@ -110,6 +124,7 @@ class Config:
             'flow': copy.deepcopy(cls.FLOW),
             'paths': copy.deepcopy(cls.PATHS),
             'eval': copy.deepcopy(cls.EVAL),
+            'lora': copy.deepcopy(cls.LORA),
         }
         
         # Override with CPU config if not using GPU
@@ -124,6 +139,5 @@ class Config:
     @classmethod
     def create_dirs(cls):
         """Create necessary directories."""
-        import os
         for path in cls.PATHS.values():
             os.makedirs(path, exist_ok=True)

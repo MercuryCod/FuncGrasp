@@ -13,7 +13,7 @@ This directory contains the technical documentation for the FuncGrasp project.
    - Optional design variants (M.0-M.3)
    - Code examples for each component
 
-2. **[dataset.md](dataset.md)** - Dataset Documentation
+2. **[oakink.md](oakink.md)** - Dataset Documentation
    - OakInk dataset structure
    - Data loading pipeline
    - Contact approximation method

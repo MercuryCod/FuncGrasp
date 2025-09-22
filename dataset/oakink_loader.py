@@ -13,8 +13,8 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import Config
 
-import rtree
-import pyembree
+# Note: rtree and pyembree are not required in the current pipeline path
+# They can be reintroduced if spatial indexing/acceleration is needed
 
 
 class OakInkDataset(Dataset):
@@ -68,12 +68,40 @@ class OakInkDataset(Dataset):
         # Load split sequences
         split_file = self.root_dir / "image" / "anno" / "split" / split_mode / f"seq_{split}.json"
         with open(split_file, 'r') as f:
-            self.sequences = json.load(f)
+            all_sequences = json.load(f)
         
         # Load object metadata
         meta_file = self.root_dir / "shape" / "metaV2" / "object_id.json"
         with open(meta_file, 'r') as f:
             self.object_meta = json.load(f)
+        
+        # Filter sequences to only include those with rendered images
+        print(f"Filtering sequences for available rendered images...")
+        self.sequences = []
+        missing_objects = set()
+        
+        for seq in all_sequences:
+            # Extract object ID from sequence
+            seq_id = seq[0] if isinstance(seq, list) else seq
+            obj_id = self._get_object_id(seq_id)
+            
+            # Check if rendered images exist
+            obj_render_dir = self.render_dir / obj_id
+            if obj_render_dir.exists():
+                # Check if at least the first view exists
+                first_view = self.OBJECT_VIEWS[0] if self.OBJECT_VIEWS else "front"
+                if (obj_render_dir / f"{first_view}.png").exists():
+                    self.sequences.append(seq)
+                else:
+                    missing_objects.add(obj_id)
+            else:
+                missing_objects.add(obj_id)
+        
+        print(f"Filtered sequences: {len(all_sequences)} -> {len(self.sequences)}")
+        print(f"Missing rendered objects: {len(missing_objects)}")
+        if len(self.sequences) == 0:
+            raise ValueError(f"No sequences found with rendered images in {self.render_dir}")
+        
         
         # Load MANO topology (once per dataset)
         self.mano_faces, self.mano_weights, self.mano_kintree = self._load_mano_topology(
@@ -279,13 +307,26 @@ class OakInkDataset(Dataset):
         images = []
         obj_render_dir = self.render_dir / obj_id
         
+        # Check if object render directory exists
+        if not obj_render_dir.exists():
+            raise FileNotFoundError(
+                f"Rendered object directory not found: {obj_render_dir}\n"
+                f"This object ({obj_id}) should have been filtered out during dataset initialization.\n"
+                f"Please check your rendered_objects directory."
+            )
+        
         # Load specified number of views
         for i, view in enumerate(self.OBJECT_VIEWS[:self.num_views]):
             img_path = obj_render_dir / f"{view}.png"
             if img_path.exists():
                 images.append(Image.open(img_path).convert('RGB'))
             else:
-                raise FileNotFoundError(f"Rendered image not found: {img_path}")
+                # List available files for debugging
+                available_files = list(obj_render_dir.glob("*.png"))
+                raise FileNotFoundError(
+                    f"Rendered image not found: {img_path}\n"
+                    f"Available files in {obj_render_dir}: {[f.name for f in available_files]}"
+                )
         
         return images
     
