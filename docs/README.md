@@ -6,22 +6,14 @@ This directory contains the technical documentation for the FuncGrasp project.
 
 ### Core Documents
 
-1. **[pipeline.md](pipeline.md)** - Architecture & Design Specification
+1. **[pipeline.md](pipeline.md)** - Architecture & Design Specification (single source of truth)
    - Model architecture details
    - Component specifications (Qwen, PointNet++, Fusion, etc.)
-   - Training methodology
+   - Training methodology (includes Quick Start and API usage examples)
    - Optional design variants (M.0-M.3)
    - Code examples for each component
 
-2. **[implementation.md](implementation.md)** - Current Implementation Status
-   - Repository structure
-   - Quick start guide
-   - Configuration reference
-   - Training instructions
-   - API usage examples
-   - Troubleshooting guide
-
-3. **[dataset.md](dataset.md)** - Dataset Documentation
+2. **[dataset.md](dataset.md)** - Dataset Documentation
    - OakInk dataset structure
    - Data loading pipeline
    - Contact approximation method
@@ -59,11 +51,11 @@ This directory contains the technical documentation for the FuncGrasp project.
 | Change Type | Update These Docs |
 |------------|------------------|
 | Architecture changes | pipeline.md, CLAUDE.md |
-| New features | implementation.md, README.md |
-| Config changes | implementation.md, pipeline.md |
-| Training updates | implementation.md |
+| New features | pipeline.md, README.md |
+| Config changes | pipeline.md |
+| Training updates | pipeline.md |
 | Dataset changes | dataset.md |
-| Bug fixes | implementation.md (if affects usage) |
+| Bug fixes | pipeline.md (if affects usage) |
 
 ### Update Checklist
 
@@ -80,10 +72,7 @@ This directory contains the technical documentation for the FuncGrasp project.
 - **Audience**: Developers implementing or extending the system
 - **Key Sections**: Model components, training loop, optional variants
 
-### implementation.md
-- **Purpose**: Current state and practical usage guide
-- **Audience**: Users training or deploying the model
-- **Key Sections**: Configuration, training guide, API reference
+<!-- implementation.md removed: pipeline.md now contains usage and training guidance -->
 
 ### dataset.md
 - **Purpose**: Data pipeline documentation
@@ -93,6 +82,6 @@ This directory contains the technical documentation for the FuncGrasp project.
 ## Recent Updates
 
 - **Semantics Batching**: Qwen2.5‑VL returns hidden states `[B, L_max, 2048]` (batched text+images). Pooling/projection to `CSEM` happens inside `FunctionalGraspModel`.
-- **Baseline Implementation**: Uses contact‑weighted pooling and a Transformer across points with no input bottleneck
+- **Contact Prediction**: 7‑way finger/palm contact classification with pooling via `1 − p(no_contact)`
 - **PointNet++ Backbone**: Uses PyTorch Geometric PointNet2 (required dependency)
 - **Repository Restructure**: Flattened directory structure; models live under top-level `models/`

@@ -11,13 +11,18 @@ import copy
 class Config:
     """Configuration class with all training parameters."""
     
+    # Contact class definitions
+    CONTACT_CLASSES = ["thumb", "index", "middle", "ring", "little", "palm", "no_contact"]
+    NO_CONTACT_INDEX = 6
+    NUM_CONTACT_CLASSES = 7
+    
     # Model architecture
     MODEL = {
         'CSEM': 256,      # Semantic feature dimension
         'CGEO': 256,      # Geometric feature dimension
         # CFUSE = CSEM + CGEO = 512 (automatically computed in model)
         'DPOSE': 63,      # Pose dimension (21 joints × 3 coordinates)
-        'K_CONTACT': 1,   # Contact classes (binary)
+        'K_CONTACT': 7,   # Contact classes (5 fingers + palm + no_contact)
         'n_points': 1024, # Points per object
     }
     
@@ -33,6 +38,7 @@ class Config:
         'log_interval': 10,     # Log every N batches
         'checkpoint_interval': 500,  # Save checkpoint every N batches
         'gradient_accumulation': 1,
+        'class_weights': None,  # Optional class weights for imbalanced contact classes
     }
     
     # Data parameters
@@ -43,6 +49,7 @@ class Config:
         'contact_threshold': 0.01,  # 1cm for contact approximation
         'use_cache': True,
         'single_view': True,  # Use single view for efficiency
+        'mano_model_path': os.environ.get('MANO_MODEL_PATH', 'assets/mano_v1_2/models/MANO_RIGHT.pkl'),
     }
     
     # CPU/GPU settings
@@ -81,15 +88,6 @@ class Config:
         'num_val_samples': 50,  # Number of validation samples
         'num_poses_per_object': 4,  # M poses to generate per object
     }
-
-    # FSDP settings (optional, used when training with FSDP)
-    FSDP = {
-        'enabled': False,  # Set to True when using train_fsdp.py
-        'sharding_strategy': 'FULL_SHARD',
-        'mixed_precision': True,
-        'cpu_offload': False,
-        'min_params_to_wrap': 100_000_000,
-    }
     
     @classmethod
     def get_config(cls, mode='train'):
@@ -112,7 +110,6 @@ class Config:
             'flow': copy.deepcopy(cls.FLOW),
             'paths': copy.deepcopy(cls.PATHS),
             'eval': copy.deepcopy(cls.EVAL),
-            'fsdp': copy.deepcopy(cls.FSDP),
         }
         
         # Override with CPU config if not using GPU

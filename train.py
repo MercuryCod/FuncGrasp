@@ -4,17 +4,13 @@ Implements training loop with contact and flow matching losses.
 """
 
 import os
-import sys
 import argparse
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from tqdm import tqdm
-import numpy as np
 
-# Optional tensorboard import
 from torch.utils.tensorboard import SummaryWriter
-HAS_TENSORBOARD = True
 
 
 from models.functional_grasp_model import FunctionalGraspModel
@@ -141,11 +137,12 @@ def train_one_epoch(model, loader, optimizer, cfg, device, writer, global_step):
             pts=pts
         )
         
-        # Contact loss
-        logits_c = out["logits_c"]
-        loss_contact = F.binary_cross_entropy_with_logits(
-            logits_c.squeeze(-1),
-            contact_labels.float()
+        # Contact loss (7-way classification)
+        logits_c = out["logits_c"]  # [B, N, 7]
+        B, N = logits_c.shape[:2]
+        loss_contact = F.cross_entropy(
+            logits_c.view(B * N, 7),
+            contact_labels.view(B * N)
         )
         
         # Flow matching loss
@@ -181,8 +178,9 @@ def train_one_epoch(model, loader, optimizer, cfg, device, writer, global_step):
             
             # Contact accuracy
             with torch.no_grad():
-                pred_contacts = torch.sigmoid(logits_c.squeeze(-1)) > 0.5
+                pred_contacts = logits_c.argmax(-1)  # [B, N]
                 contact_acc = (pred_contacts == contact_labels).float().mean()
+                
                 if writer is not None:
                     writer.add_scalar('Metrics/contact_accuracy', contact_acc.item(), global_step)
             
@@ -240,10 +238,11 @@ def validate(model, loader, cfg, device, writer, global_step):
             )
             
             # Losses
-            logits_c = out["logits_c"]
-            loss_contact = F.binary_cross_entropy_with_logits(
-                logits_c.squeeze(-1),
-                contact_labels.float()
+            logits_c = out["logits_c"]  # [B, N, 7]
+            B, N = logits_c.shape[:2]
+            loss_contact = F.cross_entropy(
+                logits_c.view(B * N, 7),
+                contact_labels.view(B * N)
             )
             
             loss_flow = compute_flow_matching_loss(
@@ -256,7 +255,7 @@ def validate(model, loader, cfg, device, writer, global_step):
                    cfg['training']['lambda_flow'] * loss_flow)
             
             # Metrics
-            pred_contacts = torch.sigmoid(logits_c.squeeze(-1)) > 0.5
+            pred_contacts = logits_c.argmax(-1)  # [B, N]
             contact_acc = (pred_contacts == contact_labels).float().mean()
             
             # Accumulate
@@ -385,7 +384,7 @@ def main():
         start_epoch = global_step // len(train_loader)
     
     # TensorBoard writer
-    writer = SummaryWriter(cfg['paths']['log_dir']) if HAS_TENSORBOARD else None
+    writer = SummaryWriter(cfg['paths']['log_dir'])
     
     # Training loop
     print("Starting training...")

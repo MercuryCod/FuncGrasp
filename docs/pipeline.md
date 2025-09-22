@@ -16,9 +16,9 @@ Point Cloud ────► PointNet++ ──► F_geo ∈ ℝ^{B×N×256}      
      ↓
 Concat s (tiled over N) ──► Fusion Transformer (across points) ──► F_fuse ∈ ℝ^{B×N×(CSEM+CGEO)}
      ↓
-Contact Head ──► p_contact ∈ [0,1]^{B×N}                        [Contact map]
+Contact Head ──► logits_c ∈ ℝ^{B×N×7}                           [7-class contact logits]
      ↓
-Contact‑weighted Pooling ──► z ∈ ℝ^{B×(CSEM+CGEO)}              [Global fused]
+Pooling (1-p(no_contact)) ──► z ∈ ℝ^{B×(CSEM+CGEO)}            [Global fused]
      ↓
 Flow Matching ──► pose ∈ ℝ^{B×28}                               [Grasp pose]
 ```
@@ -38,7 +38,7 @@ The current baseline uses a simple mean over tokens; switch to masked mean for s
 - B: Batch size (2-4 for CPU, 8-32 for GPU)
 - N: Points per object (1024)
 - Feature dimensions: CSEM=256, CGEO=256, CFUSE=CSEM+CGEO=512, CCOND=CFUSE
-- Pose dimension: DPOSE=51 (48D MANO pose parameters + 3D wrist translation, using OakInk's native representation)
+- Pose dimension: DPOSE=63 (21 joints × 3 coordinates = 63D flattened representation)
 
 ## B. Training Implementation (Core Focus)
 
@@ -49,12 +49,12 @@ The current baseline uses a simple mean over tokens; switch to masked mean for s
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
-from data.oakink_loader import create_oakink_loaders
+from dataset.oakink_loader import create_oakink_loaders
 from models.functional_grasp_model import FunctionalGraspModel
 
 def train_functional_grasp(cfg):
     # Initialize model
-    model = FunctionalGraspModel(CSEM=256, CGEO=256, DPOSE=51)
+    model = FunctionalGraspModel(CSEM=256, CGEO=256, DPOSE=63)
     
     # Data loaders with OakInk
     train_loader, val_loader = create_oakink_loaders(
@@ -72,15 +72,16 @@ def train_functional_grasp(cfg):
         for batch in train_loader:
             # Forward pass
             out = model.forward_train(
-                images=batch['images'],
-                texts=batch['texts'],  # From semantic attributes
+                images_list=batch['images_list'],
+                texts_list=batch['texts_list'],  # From semantic attributes
                 pts=batch['points']
             )
             
-            # Loss computation
-            loss_contact = F.binary_cross_entropy_with_logits(
-                out['logits_c'].squeeze(-1), 
-                batch['contact_labels']
+            # Loss computation (7-way classification)
+            B, N = out['logits_c'].shape[:2]
+            loss_contact = F.cross_entropy(
+                out['logits_c'].view(B * N, 7), 
+                batch['contact_labels'].view(B * N)
             )
             
             loss_flow = compute_flow_matching_loss(
@@ -321,14 +322,14 @@ class FusionTransformer1D(nn.Module):
 
 # models/contact_head.py
 class ContactHead(nn.Module):
-    def __init__(self, c_fuse, k=1):
+    def __init__(self, c_fuse, k=7):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(c_fuse, c_fuse//2), nn.ReLU(),
             nn.Linear(c_fuse//2, k)
         )
     def forward(self, f_fuse):
-        return self.net(f_fuse)
+        return self.net(f_fuse)  # [B, N, 7]
 ```
 
 ### E.4 Conditional Flow Matching
@@ -384,7 +385,7 @@ from .flow_matching import PoseFlow
 
 class FunctionalGraspModel(nn.Module):
     def __init__(self, qwen_name="Qwen/Qwen2.5-VL-3B-Instruct",
-                 CSEM=256, CGEO=256, DPOSE=51, K_CONTACT=1):
+                 CSEM=256, CGEO=256, DPOSE=63, K_CONTACT=7):
         super().__init__()
         self.sem = QwenSemanticsEncoder(model_name=qwen_name, csem_proj=CSEM)
         # PointNet++ via PyTorch Geometric (required)
@@ -398,13 +399,15 @@ class FunctionalGraspModel(nn.Module):
     def forward_backbone(self, images, texts, pts):
         s = self.sem(images, texts)             # [B,CSEM]
         f_geo, _ = self.pc(pts)                 # [B,N,CGEO]
-        f_fuse = self.fuse(f_geo, s)            # [B,N,CFUSE=CSEM+CGEO]
-        logits_c = self.cm(f_fuse)              # [B,N,1]
-        # Contact‑weighted pooling (baseline)
-        p = torch.sigmoid(logits_c)             # [B,N,1]
-        w = p / (p.sum(dim=1, keepdim=True) + 1e-6)
-        z = (w * f_fuse).sum(dim=1)             # [B,CFUSE]
-        c = z                                   # Conditioning is pooled fused
+        f_fuse = self.fuse(f_geo, s)            # [B,N,CFUSE]
+        logits_c = self.cm(f_fuse)              # [B,N,7]
+        # Pooling: 1 - p(no_contact) using softmax over 7 classes
+        probs = logits_c.softmax(dim=-1)        # [B,N,7]
+        p_nc = probs[..., 6]                    # no_contact index
+        w = (1.0 - p_nc)
+        w = w / (w.sum(dim=1, keepdim=True) + 1e-6)
+        z = (w.unsqueeze(-1) * f_fuse).sum(dim=1)   # [B,CFUSE]
+        c = z
         return f_fuse, logits_c, c
 
     def forward_train(self, images, texts, pts):
@@ -427,8 +430,8 @@ CONFIG = {
         'qwen_name': 'Qwen/Qwen2.5-VL-3B-Instruct',
         'freeze_qwen': True,  # Set False to fine-tune backbone
         'CSEM': 256,
-        'CGEO': 256, 
-        'DPOSE': 28,
+        'CGEO': 256,
+        'DPOSE': 63,
         'n_points': 1024
     },
     
@@ -461,19 +464,19 @@ CONFIG = {
 ### F.2 Inference Pipeline
 
 ```python
-def inference(model, image, text, point_cloud, device='cpu'):
+def inference(model, images, text, point_cloud, device='cpu'):
     """Generate grasp pose from inputs"""
     model.eval()
     with torch.no_grad():
         # Get conditioning
         _, _, conditioning = model.forward_backbone(
-            images=[image],
+            images=images,           # List[PIL.Image]
             texts=[text],
             pts=point_cloud.unsqueeze(0)
         )
         
         # Sample poses via flow matching
-        x = torch.randn(1, 28, device=device)  # Start from noise
+        x = torch.randn(1, 63, device=device)  # Start from noise
         
         # Integrate ODE
         steps = 20
@@ -490,11 +493,11 @@ def inference(model, image, text, point_cloud, device='cpu'):
 ```python
 # Each batch should provide:
 batch = {
-  "images": [PIL.Image.Image, ...],     # length B
-  "texts":  [str, ...],                 # length B, from semantic attributes
-  "points": torch.Tensor[B,N,3],        # object point cloud
-  "contact_labels": torch.Tensor[B,N],  # approximated from proximity
-  "pose": torch.Tensor[B,Dpose],        # hand pose (28D = wrist + truncated relative joints)
+  "images_list": List[List[PIL.Image.Image]],  # B lists of images (rendered views)
+  "texts_list":  List[str],                    # B prompts from semantic attributes
+  "points": torch.Tensor[B,N,3],               # object point cloud
+  "contact_labels": torch.LongTensor[B,N],     # 7-way per-point labels (0..6)
+  "pose": torch.Tensor[B,63],                  # hand pose (21 joints × 3)
 }
 ```
 
@@ -506,15 +509,16 @@ batch = {
 # 1. Activate environment
 conda activate grasp
 
-# 2. Test data loading
-python data/prepare_oakink.py --test_loading
+# 2. Render clean object views (sample or full set)
+python dataset/prepare_data.py --oakink_root /path/to/OakInk --sample --num_samples 3
+# or render all objects (may take time)
+python dataset/prepare_data.py --oakink_root /path/to/OakInk --output_dir rendered_objects
 
 # 3. Start training (CPU mode)
 python train.py \
     --data_path /path/to/OakInk \
     --batch_size 2 \
-    --device cpu \
-    --checkpoint_dir ./checkpoints
+    --device cpu
 
 # 4. Monitor with tensorboard
 tensorboard --logdir ./logs
@@ -599,19 +603,19 @@ def evaluate_grasp(pred_pose, gt_pose, point_cloud, contact_labels):
 ## L. Testing & Validation
 
 ```python
-from grasp.models.functional_grasp_model import FunctionalGraspModel
+from models.functional_grasp_model import FunctionalGraspModel
 from PIL import Image
 
 # Quick smoke test
-model = FunctionalGraspModel(DPOSE=51)
-dummy_images = [Image.open("example.jpg")] * 2
+model = FunctionalGraspModel(DPOSE=63, K_CONTACT=7)
+dummy_images = [[Image.open("example.jpg")]] * 2
 dummy_texts = ["grasp the bottle to pour water"] * 2
 dummy_pts = torch.randn(2, 1024, 3)
 
 out = model.forward_backbone(dummy_images, dummy_texts, dummy_pts)
 for k,v in zip(["F_fuse","logits_c","cond"], out):
     print(k, v.shape)
-# Expected: [B,N,Cfuse], [B,N,1], [B,Ccond]
+# Expected: [B,N,Cfuse], [B,N,7], [B,Ccond]
 ```
 
 ## L. Alignment with Original Architecture Sketches
@@ -627,7 +631,7 @@ The implementation follows the hand-drawn architecture sketches in `assets/`:
 | F_geo (1024×C_i) | F_geo ∈ ℝ^{B×1024×256} | Per-point geometric features |
 | pts | Point cloud input | 3D object points |
 | Fusion | FusionTransformer1D (across points) | Concatenate semantic+geometry then transform |
-| Contact map | ContactHead | Binary contact prediction |
+| Contact map | ContactHead | 7-way finger/palm contact classification |
 | Pooling | Contact‑weighted pooling | Aggregate to global features |
 | FM (Flow Matching) | PoseFlow | Generate grasp poses |
 

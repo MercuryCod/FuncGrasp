@@ -11,6 +11,10 @@ from pathlib import Path
 from torch_geometric.nn import fps
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import Config
+
+import rtree
+import pyembree
 
 
 class OakInkDataset(Dataset):
@@ -47,6 +51,7 @@ class OakInkDataset(Dataset):
             use_cache: Whether to cache processed data
             num_views: Number of object views to use (1-6)
             semantic_prompts: Dict mapping object IDs to functional descriptions
+            transform_to_object_frame: Whether to transform to object frame
         """
         self.root_dir = Path(root_dir)
         self.render_dir = Path(render_dir)
@@ -58,6 +63,8 @@ class OakInkDataset(Dataset):
         self.semantic_prompts = semantic_prompts or {}
         self.transform_to_object_frame = transform_to_object_frame
         
+
+        
         # Load split sequences
         split_file = self.root_dir / "image" / "anno" / "split" / split_mode / f"seq_{split}.json"
         with open(split_file, 'r') as f:
@@ -68,7 +75,12 @@ class OakInkDataset(Dataset):
         with open(meta_file, 'r') as f:
             self.object_meta = json.load(f)
         
-        # Cache directory
+        # Load MANO topology (once per dataset)
+        self.mano_faces, self.mano_weights, self.mano_kintree = self._load_mano_topology(
+            mano_model_path=Config.DATA.get('mano_model_path', 'assets/mano_v1_2/models/MANO_RIGHT.pkl')
+        )
+        
+        # Cache directory for multiclass contact labels
         self.cache_dir = self.root_dir / "cache" / split_mode / split
         if use_cache:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -83,7 +95,7 @@ class OakInkDataset(Dataset):
                 - images_list: List[List[PIL.Image]] - Batch format with B=1
                 - texts_list: List[str] - Batch format with B=1
                 - points: Object point cloud [1, N, 3]
-                - contact_labels: Binary contact labels [1, N]
+                - contact_labels: 7-class finger/palm contact labels [1, N] (LongTensor, values 0..6)
                 - pose: Hand pose 63D joint representation [1, 63]
                 - meta: Additional metadata
         """
@@ -110,17 +122,20 @@ class OakInkDataset(Dataset):
         
         # Load annotations
         hand_joints = self._load_hand_joints(frame_id)  # (21, 3) in world coordinates
+        hand_vertices = self._load_hand_vertices(frame_id)  # (778, 3) MANO hand mesh vertices (world)
         obj_transform = self._load_obj_transform(frame_id)
         
-        # Transform hand joints to object frame if requested
-        if self.transform_to_object_frame:
-            hand_joints = self._transform_joints_to_object_frame(hand_joints, obj_transform)
+        # Always transform hand joints and MANO vertices to object frame
+        hand_joints = self._transform_joints_to_object_frame(hand_joints, obj_transform)
+        hand_vertices_h = np.hstack([hand_vertices, np.ones((hand_vertices.shape[0], 1))])
+        obj_transform_inv = np.linalg.inv(obj_transform)
+        hand_vertices = (obj_transform_inv @ hand_vertices_h.T).T[:, :3]
         
-        # Load and transform object mesh
+        # Load object mesh points in object frame (no world transform applied)
         points = self._load_object_points(obj_id, obj_transform)
         
-        # Compute contact labels using hand joints (expanded surface)
-        contact_labels = self._compute_contact_labels(hand_joints, points)
+        # Compute 7-way contact labels using MANO hand mesh (preferred)
+        contact_labels = self._compute_contact_labels_mano(hand_vertices, hand_joints, points)
         
         # Generate semantic prompt
         text = self._generate_prompt(obj_id, seq_id)
@@ -129,11 +144,12 @@ class OakInkDataset(Dataset):
         pose = hand_joints.flatten()  # (21, 3) -> (63,)
         
         # Prepare output in batch format for pipeline compatibility
+        # Contact labels are always LongTensor for 7-way classification
         batch = {
             "images_list": [images],  # List[List[PIL.Image]] with B=1
             "texts_list": [text],     # List[str] with B=1
             "points": torch.tensor(points, dtype=torch.float32).unsqueeze(0),  # [1, N, 3]
-            "contact_labels": torch.tensor(contact_labels, dtype=torch.float32).unsqueeze(0),  # [1, N]
+            "contact_labels": torch.tensor(contact_labels, dtype=torch.long).unsqueeze(0),  # [1, N]
             "pose": torch.tensor(pose, dtype=torch.float32).unsqueeze(0),  # [1, 63]
             "meta": {
                 "seq_id": seq_id,
@@ -155,6 +171,16 @@ class OakInkDataset(Dataset):
         path = self.root_dir / "image" / "anno" / "hand_j" / f"{frame_id}.pkl"
         with open(path, 'rb') as f:
             return pickle.load(f)  # (21, 3)
+
+    def _load_hand_vertices(self, frame_id: str) -> np.ndarray:
+        """Load MANO hand mesh vertices if available; else raise.
+        Expected path: image/anno/hand_v/{frame_id}.pkl with shape (778, 3).
+        """
+        path = self.root_dir / "image" / "anno" / "hand_v" / f"{frame_id}.pkl"
+        if not path.exists():
+            raise FileNotFoundError(f"MANO hand vertices not found: {path}")
+        with open(path, 'rb') as f:
+            return pickle.load(f)  # (778, 3)
     
     def _load_obj_transform(self, frame_id: str) -> np.ndarray:
         """Load object 6D pose transformation matrix."""
@@ -167,6 +193,86 @@ class OakInkDataset(Dataset):
         path = self.root_dir / "image" / "anno" / "cam_intr" / f"{frame_id}.pkl"
         with open(path, 'rb') as f:
             return pickle.load(f)  # (3, 3)
+    
+    def _load_hand_vertices(self, frame_id: str) -> np.ndarray:
+        """Load MANO hand mesh vertices (778, 3) in world coordinates."""
+        path = self.root_dir / "image" / "anno" / "hand_v" / f"{frame_id}.pkl"
+        if not path.exists():
+            raise FileNotFoundError(f"MANO hand vertices not found: {path}")
+        with open(path, 'rb') as f:
+            return pickle.load(f)  # (778, 3)
+    
+    def _load_mano_topology(self, mano_model_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Load MANO topology from model file.
+        
+        Returns:
+            faces: (F, 3) triangle faces
+            weights: (778, J) skinning weights per vertex
+            kintree_table: (2, J) parent-child relationships
+        """
+        path = Path(mano_model_path)
+        if not path.exists():
+            raise FileNotFoundError(f"MANO model file not found at: {path}")
+        with open(path, 'rb') as f:
+            mano_data = pickle.load(f, encoding='latin1')
+        
+        # Extract topology
+        faces = mano_data['f']  # (F, 3)
+        weights = mano_data['weights']  # (778, J)
+        kintree_table = mano_data['kintree_table']  # (2, J)
+        
+        return faces, weights, kintree_table
+    
+    def _assign_vertex_parts(self, weights: np.ndarray, kintree_table: np.ndarray) -> np.ndarray:
+        """
+        Assign each MANO vertex to a hand part (0..5) using skinning weights and kinematic tree.
+        
+        Args:
+            weights: (778, J) skinning weights per vertex
+            kintree_table: (2, J) parent-child relationships [parent_idx, child_idx]
+            
+        Returns:
+            part_assignment: (778,) array with values 0..5 (thumb/index/middle/ring/little/palm)
+        """
+        # Find finger branch roots (direct children of wrist/root)
+        # MANO kinematic tree: joint 0 is wrist/root
+        root_joint = 0
+        children_of_root = kintree_table[1][kintree_table[0] == root_joint]
+        
+        # Map each joint to its finger branch
+        joint_to_branch = {}
+        joint_to_branch[root_joint] = 5  # wrist -> palm
+        
+        # Assign direct children to finger branches
+        finger_names = ["thumb", "index", "middle", "ring", "little"]
+        for i, child in enumerate(children_of_root):
+            if i < len(finger_names):
+                joint_to_branch[child] = i  # 0..4 for fingers
+            else:
+                joint_to_branch[child] = 5  # extra joints -> palm
+        
+        # Propagate branch assignment to all descendants
+        for joint in range(len(kintree_table[0])):
+            if joint not in joint_to_branch:
+                # Find root ancestor
+                current = joint
+                while current != root_joint and kintree_table[0][current] != -1:
+                    parent = kintree_table[0][current]
+                    if parent in joint_to_branch:
+                        joint_to_branch[joint] = joint_to_branch[parent]
+                        break
+                    current = parent
+                else:
+                    joint_to_branch[joint] = 5  # default to palm if no clear branch
+        
+        # Assign vertices to parts based on max skinning weight
+        part_assignment = np.zeros(len(weights), dtype=np.int64)
+        for vi, w in enumerate(weights):
+            max_joint = np.argmax(w)
+            part_assignment[vi] = joint_to_branch.get(max_joint, 5)  # default to palm
+            
+        return part_assignment
     
     def _load_rendered_images(self, obj_id: str) -> List[Image.Image]:
         """Load rendered object images."""
@@ -227,20 +333,13 @@ class OakInkDataset(Dataset):
             return token
         return token
     
-    def _map_object_code(self, obj_code: str) -> str:
-        """Map object code to actual object ID."""
-        # This would map codes like "01001" to actual object names
-        # For now, return as-is or implement mapping logic
-        code_to_id = {
-            "01001": "bottle_s001",
-            "01002": "bottle_s002",
-            "02001": "bowl_s001",
-            # Add more mappings as needed
-        }
-        return code_to_id.get(obj_code, f"object_{obj_code}")
-    
     def _load_object_points(self, obj_id: str, transform: np.ndarray) -> np.ndarray:
-        """Load object mesh and sample points using FPS."""
+        """Load object mesh and sample points using FPS.
+        
+        The meshes in image/obj/ are already in the object's canonical frame,
+        NOT in world coordinates. The meshes in shape/*/align/ are also in 
+        canonical frame but may need scaling.
+        """
         # Try different mesh locations and formats
         mesh_paths = [
             self.root_dir / "image" / "obj" / f"{obj_id}.obj",
@@ -250,76 +349,127 @@ class OakInkDataset(Dataset):
             self.root_dir / "shape" / "OakInkVirtualObjectsV2" / obj_id / "align" / "model_align.obj",
             self.root_dir / "shape" / "OakInkVirtualObjectsV2" / obj_id / "align" / "model_align.ply",
         ]
-        
+
         mesh = None
+        chosen_path = None
         for path in mesh_paths:
             if path.exists():
                 mesh = trimesh.load(str(path), force='mesh')
+                chosen_path = path
                 break
-        
+
         if mesh is None:
             raise FileNotFoundError(f"Object mesh not found for {obj_id}. Tried paths: {mesh_paths}")
-        else:
-            # Sample more points initially for FPS
-            initial_points, _ = trimesh.sample.sample_surface(mesh, self.n_points * 10)
-            
-            # Convert to torch for FPS
-            points_torch = torch.tensor(initial_points, dtype=torch.float32)
-            batch = torch.zeros(len(points_torch), dtype=torch.long)
-            
-            # Apply FPS to get exactly n_points
-            fps_idx = fps(points_torch, batch, ratio=float(self.n_points) / len(points_torch))
-            points = points_torch[fps_idx].numpy()
-            
-            # Apply transformation to world coordinates
-            points_homo = np.hstack([points, np.ones((len(points), 1))])
-            points = (transform @ points_homo.T).T[:, :3]
-        
+
+        # Sample more points initially for FPS
+        initial_points, _ = trimesh.sample.sample_surface(mesh, self.n_points * 10)
+
+        # Convert to torch for FPS
+        points_torch = torch.tensor(initial_points, dtype=torch.float32)
+        batch = torch.zeros(len(points_torch), dtype=torch.long)
+
+        # Apply FPS to get exactly n_points
+        fps_idx = fps(points_torch, batch, ratio=float(self.n_points) / len(points_torch))
+        points = points_torch[fps_idx].numpy()
+
+        # Handle scaling for aligned meshes
+        if chosen_path is not None:
+            path_str = str(chosen_path).replace("\\", "/")
+            # If mesh comes from shape/*/align, it may need scaling
+            if "/shape/" in path_str and "/align/" in path_str:
+                scale_file = chosen_path.parent / "scale.pkl"
+                if scale_file.exists():
+                    with open(scale_file, 'rb') as f:
+                        scale_value = pickle.load(f)
+                    # Apply scale
+                    if isinstance(scale_value, (float, int)):
+                        points = points * float(scale_value)
+                    else:
+                        scale_arr = np.array(scale_value).reshape(-1)
+                        if scale_arr.size == 1:
+                            points = points * float(scale_arr[0])
+                        elif scale_arr.size == 3:
+                            points = points * scale_arr[:3]
+                        else:
+                            raise ValueError(f"Unsupported scale format: {scale_value}")
+
+        # All meshes are already in object frame, no transform needed
         return points
     
-    def _compute_contact_labels(self, hand_joints: np.ndarray, points: np.ndarray) -> np.ndarray:
-        """Compute binary contact labels based on hand-object proximity."""
-        # Compute pairwise distances between hand joints and object points
-        # hand_joints: (21, 3), points: (N, 3)
+    
+    # _expand_hand_surface removed: replaced by MANO mesh-based labeling
+    
+    # _compute_contact_labels_multiclass removed: replaced by MANO mesh-based labeling
+
+    def _compute_contact_labels_mano(self, hand_vertices: np.ndarray, hand_joints: np.ndarray, points: np.ndarray) -> np.ndarray:
+        """
+        Compute 7-way contact labels using MANO mesh topology and point-to-mesh distances.
+        Parts: 0..4=fingers (thumb..little), 5=palm, 6=no_contact.
         
-        # Expand hand joints to include interpolated palm/finger surfaces
-        hand_points = self._expand_hand_surface(hand_joints)
+        Args:
+            hand_vertices: (778, 3) MANO vertices in object frame
+            hand_joints: (21, 3) joints (for reference, not used in computation)
+            points: (N, 3) object points in object frame
+            
+        Returns:
+            labels: (N,) array with values 0..6
+        """
+        # Assign vertices to parts using skinning weights and kinematic tree
+        part_assignment = self._assign_vertex_parts(self.mano_weights, self.mano_kintree)
         
-        # Compute minimum distance from each object point to hand
-        contact_labels = np.zeros(len(points))
+        # Build part submeshes
+        part_meshes = []
+        for part_id in range(6):  # 0..5 (thumb/index/middle/ring/little/palm)
+            # Get vertices for this part
+            part_vertex_mask = (part_assignment == part_id)
+            if not np.any(part_vertex_mask):
+                raise ValueError(f"No vertices assigned to part {part_id} ({Config.CONTACT_CLASSES[part_id]})")
+            
+            part_vertices = hand_vertices[part_vertex_mask]
+            
+            # Filter faces to only include triangles where all 3 vertices belong to this part
+            valid_faces = []
+            vertex_indices = np.where(part_vertex_mask)[0]
+            vertex_set = set(vertex_indices)
+            
+            for face in self.mano_faces:
+                if all(v in vertex_set for v in face):
+                    # Remap face indices to local part vertex indices
+                    local_face = [np.where(vertex_indices == v)[0][0] for v in face]
+                    valid_faces.append(local_face)
+            
+            if len(valid_faces) == 0:
+                raise ValueError(
+                    f"No valid faces for part {part_id} ({Config.CONTACT_CLASSES[part_id]}). "
+                    f"Check MANO topology and vertex assignment."
+                )
+            # Create proper mesh
+            part_mesh = trimesh.Trimesh(vertices=part_vertices, faces=np.asarray(valid_faces), process=False)
+            # Basic validity checks without using non-existent attributes
+            if part_mesh.faces is None or len(part_mesh.faces) == 0 or part_mesh.vertices is None or len(part_mesh.vertices) == 0:
+                raise ValueError(
+                    f"Invalid mesh for part {part_id} ({Config.CONTACT_CLASSES[part_id]}): empty vertices/faces."
+                )
+            
+            part_meshes.append(part_mesh)
+        
+        # Compute distances from object points to each part mesh
+        labels = np.full(len(points), Config.NO_CONTACT_INDEX, dtype=np.int64)
+        
         for i, point in enumerate(points):
-            distances = np.linalg.norm(hand_points - point, axis=1)
-            min_dist = np.min(distances)
-            contact_labels[i] = 1.0 if min_dist < self.contact_threshold else 0.0
+            best_part = Config.NO_CONTACT_INDEX
+            best_distance = float('inf')
+            for part_id, part_mesh in enumerate(part_meshes):
+                # Proper mesh distance using trimesh nearest surface
+                _, distance, _ = part_mesh.nearest.on_surface([point])
+                distance = float(distance[0])
+                if distance < best_distance:
+                    best_distance = distance
+                    best_part = part_id
+            if best_distance < self.contact_threshold:
+                labels[i] = best_part
         
-        return contact_labels
-    
-    def _expand_hand_surface(self, joints: np.ndarray, n_interp: int = 5) -> np.ndarray:
-        """Expand hand joints to approximate hand surface."""
-        # MANO joint order: wrist(1) + thumb(4) + fingers(4x4)
-        expanded = [joints[0]]  # Wrist
-        
-        # Finger chains
-        finger_chains = [
-            [0, 1, 2, 3, 4],      # Thumb
-            [0, 5, 6, 7, 8],      # Index
-            [0, 9, 10, 11, 12],   # Middle
-            [0, 13, 14, 15, 16],  # Ring
-            [0, 17, 18, 19, 20]   # Pinky
-        ]
-        
-        for chain in finger_chains:
-            for i in range(len(chain) - 1):
-                # Interpolate between consecutive joints
-                start = joints[chain[i]]
-                end = joints[chain[i + 1]]
-                for t in np.linspace(0, 1, n_interp):
-                    expanded.append(start + t * (end - start))
-        
-        return np.array(expanded)
-    
-    
-    
+        return labels
     
     def _generate_prompt(self, obj_id: str, seq_id: str) -> str:
         """Generate functional description for the object."""
@@ -411,9 +561,6 @@ def create_oakink_loaders(
     num_workers: int = 4,
     split_mode: str = "split0",
     use_part_dataset: bool = True,
-    distributed: bool = False,
-    world_size: int = 1,
-    rank: int = 0,
     **dataset_kwargs
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """
@@ -426,7 +573,7 @@ def create_oakink_loaders(
         num_workers: Number of data loading workers
         split_mode: Data split to use
         use_part_dataset: Whether to use part-based semantic annotations
-        distributed: Whether to use DistributedSampler for FSDP
+        distributed: Whether to use DistributedSampler
         world_size: Number of distributed processes
         rank: Current process rank
         **dataset_kwargs: Additional arguments for dataset
@@ -465,31 +612,11 @@ def create_oakink_loaders(
         }
         return batch
 
-    # Create samplers for distributed training if needed
-    if distributed:
-        from torch.utils.data.distributed import DistributedSampler
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True
-        )
-        test_sampler = DistributedSampler(
-            test_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=False
-        )
-    else:
-        train_sampler = None
-        test_sampler = None
-
     # Create data loaders
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
+        shuffle=True,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
@@ -500,7 +627,6 @@ def create_oakink_loaders(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        sampler=test_sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=True,

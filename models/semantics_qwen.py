@@ -11,8 +11,6 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from qwen_vl_utils import process_vision_info
 
 
-MODEL_PATH = "/root/FuncGrasp/"
-
 class QwenSemanticsEncoder(nn.Module):
     """
     Wraps Qwen2.5-VL-3B-Instruct to produce batched token hidden states H ∈ ℝ^{B×L_max×2048}.
@@ -32,8 +30,8 @@ class QwenSemanticsEncoder(nn.Module):
         super().__init__()
         
         # Fixed model: Qwen2.5-VL-3B-Instruct
-        model_name = "Qwen2.5-VL-3B-Instruct"
-        model_name = os.path.join(MODEL_PATH, model_name)
+        model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
+        # model_name = os.path.join(MODEL_PATH, model_name)
         
         # Initialize processor for handling images and text
         self.processor = AutoProcessor.from_pretrained(

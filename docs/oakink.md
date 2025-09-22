@@ -4,7 +4,7 @@
 
 OakInk is a large-scale knowledge repository for hand-object interaction understanding. It contains multi-view RGB images, object 3D models, hand poses, and semantic annotations for dexterous manipulation scenarios.
 
-**Dataset Location**: `/DATA/disk0/OakInk/`
+**Dataset Location**: `/mnt/data/changma/OakInk/`
 
 ## Dataset Structure
 
@@ -273,11 +273,11 @@ CAMERA_CONFIG = {
 ```python
 # Expected batch format for training (after rendering)
 batch = {
-    'images_list': List[List[PIL.Image]],     # RENDERED multi-view object images
-    'texts_list': List[str],                  # Generated from object attributes  
-    'points': torch.Tensor[B, 1024, 3],      # Sampled from object meshes
-    'contact_labels': torch.Tensor[B, 1024], # From hand-object proximity
-    'pose': torch.Tensor[B, 28]              # From hand joint annotations
+    'images_list': List[List[PIL.Image]],      # Rendered multi-view object images per sample
+    'texts_list': List[str],                   # Generated from object attributes  
+    'points': torch.Tensor[B, 1024, 3],       # Sampled from object meshes (object frame)
+    'contact_labels': torch.LongTensor[B, 1024],  # 7-way per-point labels (0..6)
+    'pose': torch.Tensor[B, 63]               # 21 joints × 3 coordinates
 }
 ```
 
@@ -293,11 +293,13 @@ batch = {
 
 3. **Hand Pose Processing**:
    - Load from `image/anno/hand_j/{sequence}.pkl`
-   - Convert to 28D representation (3D wrist + 25 joints)
+   - Convert to 63D representation (21 joints × 3), transformed to object frame
 
-4. **Contact Label Generation**:
-   - Compute hand-object proximity at 1cm threshold
-   - Project to point cloud for per-point labels
+4. **Contact Label Generation (7-way finger/palm)**:
+   - Use MANO hand mesh vertices `image/anno/hand_v/{sequence}.pkl` (778×3) transformed to object frame
+   - Assign each MANO vertex to a hand part (thumb/index/middle/ring/little/palm) via skinning tree
+   - For each object point, compute nearest distance to each part mesh and choose argmin
+   - Threshold at 1cm for contact; else label as `no_contact`
 
 5. **Semantic Text Generation**:
    - Load attributes from `shape/metaV2/object_id.json`
@@ -370,13 +372,13 @@ def render_object_open3d(mesh_path, output_dir):
 ```
 
 ### Current Status
-- ✅ **Point Clouds**: Can be generated from available meshes
-- ✅ **Text Instructions**: Can be generated from semantic attributes
-- ✅ **Hand Poses**: Available in annotations
-- ✅ **Contact Labels**: Can be computed from hand-object proximity
-- ❌ **Object Images**: **MISSING - Need to implement rendering pipeline**
+- ✅ **Point Clouds**: Generated from meshes via FPS
+- ✅ **Text Instructions**: Generated from semantic attributes
+- ✅ **Hand Poses**: 21 joints available and transformed to object frame (63D)
+- ✅ **Contact Labels**: 7-way finger/palm labels via MANO mesh proximity with 1cm threshold
+- ✅ **Object Images**: Rendered multi-view images implemented under `dataset/prepare_data.py`
 
-**Bottom Line**: OakInk provides all necessary data except clean object images. We must implement a rendering pipeline to generate multi-view object images from the provided 3D meshes before training the FuncGrasp model.
+**Bottom Line**: With the rendering utility in place, the loader expects rendered views, 63D joint poses, and 7-way contact labels for training.
 
 ## Hand Pose Representation Analysis
 
@@ -397,22 +399,11 @@ def render_object_open3d(mesh_path, output_dir):
 
 ### Decision for FuncGrasp (Current Setting)
 
-We will use the MANO parameters as-is for OakInk:
-- Pose vector: `DPOSE = 51` composed of `pose[48]` (MANO rotations) + `tsl[3]` (wrist translation)
-- No conversion to 28D for now
-- This aligns directly with OakInk's provided annotations
+We use direct 21-joint positions (63D) transformed to the object frame:
+- Pose vector: `DPOSE = 63` composed of `21 × (x,y,z)`
+- Benefits: simpler pipeline, direct interpretability, no MANO dependency in the model
 
-**Data Loader Guidance (51D)**:
-```python
-# In oakink_loader.py
-def load_hand_pose_51d(hand_param):
-    """Build 51D pose from OakInk MANO annotations."""
-    pose = hand_param['pose']      # [48]
-    tsl  = hand_param['tsl']       # [3]
-    pose_51d = np.concatenate([pose, tsl], axis=0)  # [51]
-    return torch.from_numpy(pose_51d).float()
-```
-
-This dataset provides a comprehensive foundation for training functional grasp models, but requires:
-1. **Object rendering pipeline** for clean multi-view images
-2. **Pose dimension set to 51D** (MANO 48D + translation 3D) in training configuration
+This dataset supports training with:
+1. Rendered object images (multi-view) for semantics
+2. 63D joint poses in object frame
+3. 7-way finger/palm contact labels derived from MANO mesh proximity

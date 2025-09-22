@@ -45,10 +45,10 @@ def inspect_pipeline(B=2, N=1024, num_images_per_sample=[2, 3]):
     print(f"  Batch size (B): {B}")
     print(f"  Points per cloud (N): {N}")
     print(f"  Images per sample: {num_images_per_sample}")
-    print(f"  Model dimensions: CSEM=256, CGEO=256, DPOSE=28")
+    print(f"  Model dimensions: CSEM=256, CGEO=256, DPOSE=63, K_CONTACT=7")
     
     # Create model
-    model = FunctionalGraspModel(CSEM=256, CGEO=256, DPOSE=28)
+    model = FunctionalGraspModel(CSEM=256, CGEO=256, DPOSE=63)
     device = torch.device('cpu')
     model = model.to(device)
     model.eval()
@@ -138,29 +138,33 @@ def inspect_pipeline(B=2, N=1024, num_images_per_sample=[2, 3]):
     
     # ==================== CONTACT PREDICTION ====================
     print("\n" + "="*80)
-    print("STAGE 5: CONTACT PREDICTION")
+    print("STAGE 5: CONTACT PREDICTION (7-way classification)")
     print("="*80)
     
     with torch.no_grad():
         logits_c = model.cm(f_fuse)
-        p_contact = torch.sigmoid(logits_c)
+        probs = logits_c.softmax(dim=-1)
         
         print("\nContact head outputs:")
         print_shape("logits_c", logits_c, indent=1)
-        print_shape("p_contact (probabilities)", p_contact, indent=1)
+        print_shape("probs (softmax)", probs, indent=1)
+        print("\nContact classes: thumb, index, middle, ring, little, palm, no_contact")
     
     # ==================== CONDITIONING ====================
     print("\n" + "="*80)
-    print("STAGE 6: CONTACT-WEIGHTED POOLING")
+    print("STAGE 6: POOLING (1 - p(no_contact))")
     print("="*80)
     
     with torch.no_grad():
-        # Contact-weighted pooling
-        w = p_contact / (p_contact.sum(dim=1, keepdim=True) + 1e-6)
-        c = (w * f_fuse).sum(dim=1)
+        # 1 - p(no_contact) pooling
+        p_nc = probs[..., 6]  # no_contact is at index 6
+        w = 1.0 - p_nc
+        w = w / (w.sum(dim=1, keepdim=True) + 1e-6)
+        c = (w.unsqueeze(-1) * f_fuse).sum(dim=1)
         
         print("\nWeighted pooling:")
-        print_shape("w (normalized weights)", w, indent=1)
+        print_shape("p_nc (no_contact prob)", p_nc, indent=1)
+        print_shape("w (1 - p_nc, normalized)", w, indent=1)
         print_shape("c (conditioning)", c, indent=1)
     
     # ==================== FLOW MATCHING ====================
@@ -210,12 +214,12 @@ Fusion:
   - Concat: [{B}, {N}, 256] + [{B}, {N}, 256] → [{B}, {N}, 512]
 
 Contact:
-  - Logits: [{B}, {N}, 1]
-  - Weighted pool: [{B}, 512]
+  - Logits: [{B}, {N}, 7] (7-way classification)
+  - Weighted pool: [{B}, 512] (using 1 - p(no_contact))
 
 Flow:
   - Condition: [{B}, 512]
-  - Output: [{B}, 28] (pose parameters)
+  - Output: [{B}, 63] (21 joints × 3 coordinates)
 """)
 
 
@@ -235,7 +239,7 @@ def inspect_custom(images_list, texts_list, pts):
     print(f"Images per sample: {[len(imgs) for imgs in images_list]}")
     
     # Create model and run inspection
-    model = FunctionalGraspModel(CSEM=256, CGEO=256, DPOSE=28)
+    model = FunctionalGraspModel(CSEM=256, CGEO=256, DPOSE=63)
     device = pts.device
     model = model.to(device)
     

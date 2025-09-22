@@ -31,7 +31,7 @@ sample_rendered_objects/
 *.png
 logs/
 checkpoints/
-outputs/
+output/
 logs/
 checkpoints/
 outputs/
@@ -40,6 +40,6 @@ assets/
 test_pipeline.py
 CLAUDE.md
 Qwen*
-
+manopth/
 
 
