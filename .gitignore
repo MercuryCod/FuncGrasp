@@ -27,11 +27,12 @@ Thumbs.db
 # Testing
 .pytest_cache/
 test*
+show_sample.py
 sample_rendered_objects/
 *.png
 logs/
 checkpoints/
-outputs/
+output/
 logs/
 checkpoints/
 outputs/
@@ -39,7 +40,7 @@ outputs/
 assets/
 test_pipeline.py
 CLAUDE.md
-
-
+Qwen*
+manopth/
 
 

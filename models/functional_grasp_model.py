@@ -14,6 +14,11 @@ from .fusion_transformer import FusionTransformer1D
 from .contact_head import ContactHead
 from .flow_matching import PoseFlow
 
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import Config
+
 
 class FunctionalGraspModel(nn.Module):
     """
@@ -34,7 +39,9 @@ class FunctionalGraspModel(nn.Module):
         CSEM: int = 256,
         CGEO: int = 256,
         DPOSE: int = 63,
-        K_CONTACT: int = 1
+        K_CONTACT: int = 7,
+        qwen_tuning: str = 'frozen',
+        lora_cfg: dict = None
     ):
         """
         Args:
@@ -42,12 +49,14 @@ class FunctionalGraspModel(nn.Module):
             CGEO: Geometric feature dimension
             DPOSE: Pose dimension (21 joints × 3 coordinates = 63)
             K_CONTACT: Number of contact classes
+            qwen_tuning: Tuning mode for Qwen ('frozen', 'full', 'lora')
+            lora_cfg: LoRA configuration dict (used when qwen_tuning='lora')
         """
         super().__init__()
         
         # Component models
         # Qwen2.5-VL encoder; returns last_hidden_state [B, L, Dq]
-        self.sem = QwenSemanticsEncoder()
+        self.sem = QwenSemanticsEncoder(tuning=qwen_tuning, lora_cfg=lora_cfg)
         # Pool + project semantic hidden states to CSEM for fusion using dynamic Dq
         dq = int(getattr(self.sem, 'hidden_size', 0) or 0)
         if dq <= 0:
@@ -71,6 +80,9 @@ class FunctionalGraspModel(nn.Module):
             c_fuse=CFUSE,
             k=K_CONTACT
         )
+        # Sanity check: enforce 7-class contact head
+        if getattr(self.cm.net[-1], 'out_features', None) != 7:
+            raise ValueError("ContactHead must output 7 classes (thumb,index,middle,ring,little,palm,no_contact)")
         
         self.flow = PoseFlow(
             d_pose=DPOSE,
@@ -91,11 +103,9 @@ class FunctionalGraspModel(nn.Module):
         
         Returns:
             f_fuse: [B, N, CFUSE] fused features
-            logits_c: [B, N, 1] contact logits
+            logits_c: [B, N, 7] contact logits
             c: [B, CFUSE] conditioning vector (pooled fused)
         """
-        B = pts.shape[0]
-        
         # Semantic encoding: hidden states [B, L_max, Dq] with attention mask → masked-pooled s [B, CSEM]
         H, attention_mask = self.sem(images_list, texts_list)  # H: [B, L_max, Dq], attention_mask: [B, L_max]
         if attention_mask is not None:
@@ -119,35 +129,16 @@ class FunctionalGraspModel(nn.Module):
         f_fuse = self.fuse(f_geo, s)  # [B, N, CFUSE]
         
         # Contact prediction
-        logits_c = self.cm(f_fuse)  # [B, N, 1]
+        logits_c = self.cm(f_fuse)  # [B, N, 7]
         
-        # Contact‑weighted pooling (baseline)
-        p = torch.sigmoid(logits_c)  # [B, N, 1]
-        w = p / (p.sum(dim=1, keepdim=True) + 1e-6)
-        z = (w * f_fuse).sum(dim=1)  # [B, CFUSE]
+        # Pooling: 1 - p(no_contact) for 7-way classification
+        probs = logits_c.softmax(dim=-1)  # [B, N, 7]
+        p_nc = probs[..., Config.NO_CONTACT_INDEX]  # [B, N]
+        w = 1.0 - p_nc  # [B, N]
+        w = w / (w.sum(dim=1, keepdim=True) + 1e-6)
+        z = (w.unsqueeze(-1) * f_fuse).sum(dim=1)  # [B, CFUSE]
+        
         c = z  # Conditioning is pooled fused features
-        
-        """
-        Optional Advanced Features (from pipeline.md sections M.1-M.3):
-        
-        M.1 Contact-weighted pooling (focus on graspable regions):
-        p = torch.sigmoid(logits_c)  # [B, N, 1]
-        w = p / (p.sum(dim=1, keepdim=True) + 1e-6)
-        z = (w * f_fuse).sum(dim=1)  # [B, CFUSE]
-        
-        # With warm-up mixing:
-        z_mean = f_fuse.mean(dim=1)
-        alpha = max(0.0, 1.0 - step / warmup_steps)
-        z = alpha * z_mean + (1 - alpha) * z_weighted
-        
-        M.2 Global geometry skip path (preserve coarse shape context):
-        f_geo, g = self.pc(pts)  # Get global features g
-        c = torch.cat([z, s, g], dim=-1)  # [B, CFUSE + CSEM + CGEO]
-        # Requires: self.cond = nn.Linear(CFUSE + CSEM + CGEO, CCOND)
-        # And: self.flow = PoseFlow(d_pose=DPOSE, c_cond=CCOND)
-        
-        M.3 Input projection bottleneck is already implemented in FusionTransformer1D
-        """
         
         return f_fuse, logits_c, c
 
@@ -163,7 +154,7 @@ class FunctionalGraspModel(nn.Module):
         Returns:
             dict with:
                 f_fuse: [B, N, CFUSE] fused features
-                logits_c: [B, N, 1] contact logits
+                logits_c: [B, N, 7] contact logits
                 cond: [B, CCOND] conditioning vector
         """
         # Get features and conditioning
@@ -221,3 +212,4 @@ class FunctionalGraspModel(nn.Module):
                 x = x + dt * v
             
             return x
+

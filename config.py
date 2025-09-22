@@ -11,14 +11,33 @@ import copy
 class Config:
     """Configuration class with all training parameters."""
     
+    # Contact class definitions
+    CONTACT_CLASSES = ["thumb", "index", "middle", "ring", "little", "palm", "no_contact"]
+    NO_CONTACT_INDEX = 6
+    NUM_CONTACT_CLASSES = 7
+    
     # Model architecture
     MODEL = {
         'CSEM': 256,      # Semantic feature dimension
         'CGEO': 256,      # Geometric feature dimension
         # CFUSE = CSEM + CGEO = 512 (automatically computed in model)
         'DPOSE': 63,      # Pose dimension (21 joints × 3 coordinates)
-        'K_CONTACT': 1,   # Contact classes (binary)
+        'K_CONTACT': 7,   # Contact classes (5 fingers + palm + no_contact)
         'n_points': 1024, # Points per object
+        'qwen_tuning': 'frozen',  # 'frozen', 'full', or 'lora'
+    }
+    
+    # LoRA configuration (only used when qwen_tuning='lora')
+    LORA = {
+        'r': 16,                    # LoRA rank
+        'alpha': 32,                # LoRA alpha (scaling factor)
+        'dropout': 0.05,            # LoRA dropout
+        'target_modules': [         # Which modules to apply LoRA to
+            'q_proj', 'k_proj', 'v_proj', 'o_proj',
+            'gate_proj', 'up_proj', 'down_proj'
+        ],
+        'bias': 'none',             # 'none', 'all', or 'lora_only'
+        'use_8bit': False,          # Whether to use 8-bit base model (requires bitsandbytes)
     }
     
     # Training parameters
@@ -33,6 +52,7 @@ class Config:
         'log_interval': 10,     # Log every N batches
         'checkpoint_interval': 500,  # Save checkpoint every N batches
         'gradient_accumulation': 1,
+        'class_weights': None,  # Optional class weights for imbalanced contact classes
     }
     
     # Data parameters
@@ -43,6 +63,7 @@ class Config:
         'contact_threshold': 0.01,  # 1cm for contact approximation
         'use_cache': True,
         'single_view': True,  # Use single view for efficiency
+        'mano_model_path': os.environ.get('MANO_MODEL_PATH', 'assets/mano_v1_2/models/MANO_RIGHT.pkl'),
     }
     
     # CPU/GPU settings
@@ -103,6 +124,7 @@ class Config:
             'flow': copy.deepcopy(cls.FLOW),
             'paths': copy.deepcopy(cls.PATHS),
             'eval': copy.deepcopy(cls.EVAL),
+            'lora': copy.deepcopy(cls.LORA),
         }
         
         # Override with CPU config if not using GPU
@@ -117,6 +139,5 @@ class Config:
     @classmethod
     def create_dirs(cls):
         """Create necessary directories."""
-        import os
         for path in cls.PATHS.values():
             os.makedirs(path, exist_ok=True)
