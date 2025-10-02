@@ -4,11 +4,12 @@ Implements training loop with contact and flow matching losses.
 """
 
 import os
+import sys
+import logging
 import argparse
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
-from tqdm import tqdm
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -118,13 +119,13 @@ def train_one_epoch(model, loader, optimizer, cfg, device, writer, global_step):
     # Get trainable parameters
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     
-    # Progress bar
-    pbar = tqdm(loader, desc="Training")
+    # Iterator over loader
+    iterator = iter(loader)
     
     grad_accum_steps = max(1, cfg['training'].get('gradient_accumulation', 1))
     optimizer.zero_grad()
 
-    for batch_idx, batch in enumerate(pbar):
+    for batch_idx, batch in enumerate(iterator):
         # Move data to device
         pts = batch["points"].to(device)
         contact_labels = batch["contact_labels"].to(device)
@@ -169,8 +170,8 @@ def train_one_epoch(model, loader, optimizer, cfg, device, writer, global_step):
             optimizer.step()
             optimizer.zero_grad()
         
-        # Logging
-        if batch_idx % cfg['training']['log_interval'] == 0:
+        # Logging (step-based across epochs)
+        if global_step % cfg['training']['log_interval'] == 0:
             if writer is not None:
                 writer.add_scalar('Loss/total', loss.item(), global_step)
                 writer.add_scalar('Loss/contact', loss_contact.item(), global_step)
@@ -184,12 +185,7 @@ def train_one_epoch(model, loader, optimizer, cfg, device, writer, global_step):
                 if writer is not None:
                     writer.add_scalar('Metrics/contact_accuracy', contact_acc.item(), global_step)
             
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'contact': f'{loss_contact.item():.4f}',
-                'flow': f'{loss_flow.item():.4f}',
-                'acc': f'{contact_acc.item():.3f}'
-            })
+            print(f"Step {global_step:06d} | loss={loss.item():.4f} | contact={loss_contact.item():.4f} | flow={loss_flow.item():.4f} | acc={contact_acc.item():.3f}")
         
         # Checkpoint saving
         if global_step > 0 and global_step % cfg['training']['checkpoint_interval'] == 0:
@@ -224,7 +220,7 @@ def validate(model, loader, cfg, device, writer, global_step):
     num_batches = 0
     
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Validation"):
+        for batch in loader:
             # Move data to device
             pts = batch["points"].to(device)
             contact_labels = batch["contact_labels"].to(device)
@@ -295,7 +291,7 @@ def save_checkpoint(model, optimizer, step, cfg):
         f'checkpoint_step_{step}.pt'
     )
     torch.save(checkpoint, path)
-    print(f"Saved checkpoint to {path}")
+    logging.getLogger('funcgrasp').info("Saved checkpoint to %s", path)
     
     # Save LoRA adapters separately if using LoRA
     if cfg['model'].get('qwen_tuning') == 'lora':
@@ -304,6 +300,7 @@ def save_checkpoint(model, optimizer, step, cfg):
             f'lora_adapters_step_{step}'
         )
         model.sem.save_lora_weights(lora_path)
+        logging.getLogger('funcgrasp').info("LoRA weights saved to %s", lora_path)
 
 
 def main():
@@ -319,6 +316,8 @@ def main():
                         help='Device (cuda/cpu)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to checkpoint to resume from')
+    parser.add_argument('--checkpoint_interval', type=int, default=None,
+                        help='Batches between checkpoint saves during training')
     
     # LoRA-specific arguments
     parser.add_argument('--qwen_tuning', type=str, default=None,
@@ -338,6 +337,9 @@ def main():
     parser.add_argument('--lora_use_8bit', action='store_true',
                         help='Use 8-bit base model with LoRA (requires bitsandbytes)')
     
+    parser.add_argument('--log_interval', type=int, default=None,
+                        help='Batches between console/TensorBoard logs')
+
     args = parser.parse_args()
     
     # Get configuration
@@ -352,6 +354,10 @@ def main():
         cfg['training']['epochs'] = args.epochs
     if args.device:
         cfg['device'] = args.device
+    if args.log_interval:
+        cfg['training']['log_interval'] = args.log_interval
+    if args.checkpoint_interval:
+        cfg['training']['checkpoint_interval'] = args.checkpoint_interval
     
     # Override LoRA settings
     if args.qwen_tuning:
@@ -369,23 +375,51 @@ def main():
     if args.lora_use_8bit:
         cfg['lora']['use_8bit'] = True
     
+    # Initialize logging to file (run.log)
+    os.makedirs(cfg['paths']['log_dir'], exist_ok=True)
+    log_path = os.path.join(cfg['paths']['log_dir'], 'run.log')
+    logger = logging.getLogger('funcgrasp')
+    logger.setLevel(logging.INFO)
+    # Clear existing handlers
+    logger.handlers = []
+    fh = logging.FileHandler(log_path, mode='a')
+    fh.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    # Redirect stdout/stderr to logger so prints from dependencies also go to run.log
+    class _LoggerWriter:
+        def __init__(self, _logger, level):
+            self._logger = _logger
+            self._level = level
+        def write(self, message):
+            message = str(message)
+            if message and not message.isspace():
+                for line in message.rstrip().splitlines():
+                    self._logger.log(self._level, line)
+        def flush(self):
+            pass
+    sys.stdout = _LoggerWriter(logger, logging.INFO)
+    sys.stderr = _LoggerWriter(logger, logging.WARNING)
+
     # Display tuning mode
-    print(f"Qwen tuning mode: {cfg['model']['qwen_tuning']}")
+    logger.info("Qwen tuning mode: %s", cfg['model']['qwen_tuning'])
     if cfg['model']['qwen_tuning'] == 'lora':
-        print(f"LoRA config: r={cfg['lora']['r']}, alpha={cfg['lora']['alpha']}, dropout={cfg['lora']['dropout']}")
-        print(f"LoRA targets: {cfg['lora']['target_modules']}")
+        logger.info("LoRA config: r=%s, alpha=%s, dropout=%s", cfg['lora']['r'], cfg['lora']['alpha'], cfg['lora']['dropout'])
+        logger.info("LoRA targets: %s", cfg['lora']['target_modules'])
     
     # Create directories
     Config.create_dirs()
     
     # Device
     device = torch.device(cfg['device'])
-    print(f"Using device: {device}")
+    logger.info("Using device: %s", device)
     
     # Data loaders
-    print("Loading data...")
-    # Map single_view/view_idx to num_views used by the dataset
-    num_views = 1 if cfg['data'].get('single_view', True) else 6
+    logger.info("Loading data...")
+    # Use all 6 views
+    num_views = 6
     train_loader, val_loader = create_oakink_loaders(
         root_dir=cfg['data']['root_dir'],
         render_dir=cfg['data'].get('render_dir', './rendered_objects'),
@@ -399,7 +433,7 @@ def main():
     )
     
     # Model
-    print("Initializing model...")
+    logger.info("Initializing model...")
     model = FunctionalGraspModel(
         CSEM=cfg['model']['CSEM'],
         CGEO=cfg['model']['CGEO'],
@@ -412,8 +446,8 @@ def main():
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
+    logger.info("Total parameters: %s", f"{total_params:,}")
+    logger.info("Trainable parameters: %s", f"{trainable_params:,}")
     
     # Optimizer
     trainable_params_list = [p for p in model.parameters() if p.requires_grad]
@@ -427,7 +461,7 @@ def main():
     global_step = 0
     start_epoch = 0
     if args.checkpoint:
-        print(f"Loading checkpoint from {args.checkpoint}")
+        logger.info("Loading checkpoint from %s", args.checkpoint)
         checkpoint = torch.load(args.checkpoint, map_location=device)
         
         # Handle LoRA adapter loading if needed
@@ -451,17 +485,16 @@ def main():
                 f'lora_adapters_step_{global_step}'
             )
             if os.path.exists(lora_path):
-                print(f"Loading LoRA adapters from {lora_path}")
+                logger.info("Loading LoRA adapters from %s", lora_path)
                 # Note: actual loading handled by PEFT through model state dict
     
     # TensorBoard writer
     writer = SummaryWriter(cfg['paths']['log_dir'])
     
     # Training loop
-    print("Starting training...")
+    logger.info("Starting training...")
     for epoch in range(start_epoch, cfg['training']['epochs']):
-        print(f"\nEpoch {epoch + 1}/{cfg['training']['epochs']}")
-        
+        # print(f"Epoch {epoch + 1}/{cfg['training']['epochs']}")
         # Train
         global_step = train_one_epoch(
             model, train_loader, optimizer, cfg, device, writer, global_step
@@ -469,16 +502,15 @@ def main():
         
         # Validate
         if (epoch + 1) % 5 == 0:  # Validate every 5 epochs
-            print("Running validation...")
+            logger.info("Running validation...")
             metrics = validate(model, val_loader, cfg, device, writer, global_step)
-            print(f"Validation metrics: {metrics}")
+            logger.info("Validation metrics: %s", metrics)
         
-        # Save checkpoint at end of epoch
-        save_checkpoint(model, optimizer, global_step, cfg)
+        # Note: Checkpoints are saved strictly by step via checkpoint_interval
     
     if writer is not None:
         writer.close()
-    print("Training complete!")
+    logger.info("Training complete!")
 
 
 if __name__ == "__main__":

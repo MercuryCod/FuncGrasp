@@ -102,6 +102,35 @@ class OakInkDataset(Dataset):
         if len(self.sequences) == 0:
             raise ValueError(f"No sequences found with rendered images in {self.render_dir}")
         
+        # Filter to final grasp frames only (last frame per sequence)
+        print(f"Filtering to final grasp frames (last frame per sequence)...")
+        from collections import defaultdict
+        seq_groups = defaultdict(list)
+        
+        for seq in self.sequences:
+            seq_id, timestamp, _, _ = seq  # frame_idx and view_idx used in seq itself
+            # Group by (seq_id, timestamp) to identify unique grasp sequences
+            key = (seq_id, timestamp)
+            seq_groups[key].append(seq)
+        
+        # Keep only the last frame (max frame_idx) of each sequence, with view 0
+        final_sequences = []
+        for key, frames in seq_groups.items():
+            # Find maximum frame index
+            max_frame_idx = max(f[2] for f in frames)
+            # Get all frames at max_frame_idx
+            final_frames = [f for f in frames if f[2] == max_frame_idx]
+            # Prefer view 0, fallback to first available view
+            view_0_frames = [f for f in final_frames if f[3] == 0]
+            if view_0_frames:
+                final_sequences.append(view_0_frames[0])
+            elif final_frames:
+                final_sequences.append(final_frames[0])
+        
+        print(f"Final grasp filtering: {len(self.sequences)} frames -> {len(final_sequences)} final grasps")
+        print(f"  Unique grasp sequences: {len(seq_groups)}")
+        self.sequences = final_sequences
+        
         
         # Load MANO topology (once per dataset)
         self.mano_faces, self.mano_weights, self.mano_kintree = self._load_mano_topology(
