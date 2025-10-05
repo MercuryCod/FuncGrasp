@@ -25,6 +25,8 @@ class Config:
         'K_CONTACT': 7,   # Contact classes (5 fingers + palm + no_contact)
         'n_points': 1024, # Points per object
         'qwen_tuning': 'frozen',  # 'frozen', 'full', or 'lora'
+        'contact_regression': True,  # Use class-based regression (BCE) instead of CE
+        'inference_threshold': 0.4,  # Threshold for no_contact prediction in regression mode
     }
     
     # LoRA configuration (only used when qwen_tuning='lora')
@@ -47,12 +49,13 @@ class Config:
         'weight_decay': 0.05,
         'epochs': 100,
         'gradient_clip': 1.0,
-        'lambda_contact': 1.0,  # Contact loss weight
+        'lambda_contact': 1.5,  # Contact loss weight (increased for initial training)
         'lambda_flow': 1.0,     # Flow matching loss weight
         'log_interval': 10,     # Log every N batches
         'checkpoint_interval': 500,  # Save checkpoint every N batches
         'gradient_accumulation': 1,
-        'class_weights': None,  # Optional class weights for imbalanced contact classes
+        'contact_loss_type': 'bce',  # 'bce' for regression, 'ce' for classification
+        'pos_weight': None,  # Computed from data: sqrt-inverse class frequencies
     }
     
     # Data parameters
@@ -60,10 +63,13 @@ class Config:
         'root_dir': os.environ.get('OAKINK_PATH', '/DATA/disk0/OakInk'),
         'render_dir': os.environ.get('OAKINK_RENDER_DIR', '/DATA/disk0/OakInk/rendered_objects'),
         'split_mode': 'split0',  # Object-based split
-        'contact_threshold': 0.01,  # 1cm for contact approximation
+        'contact_threshold': 0.008,  # 8mm for contact approximation (reduced from 10mm)
         'use_cache': True,
         'single_view': True,  # Use single view for efficiency
         'mano_model_path': os.environ.get('MANO_MODEL_PATH', 'assets/mano_v1_2/models/MANO_RIGHT.pkl'),
+        'contact_aware_sampling': False,  # Enable contact-aware point sampling
+        'contact_aware_ratio': 0.5,  # Ratio of near-hand points when contact-aware sampling is enabled
+        'contact_aware_radius_factor': 2.0,  # Multiplier for contact threshold to define "near" region
     }
     
     # CPU/GPU settings
@@ -88,11 +94,21 @@ class Config:
         'ode_solver': 'euler',  # ODE solver type
     }
     
+    # Regression hyperparameters for soft contact targets
+    REGRESSION_HPARAMS = {
+        'label_type': 'gaussian',  # 'gaussian' or 'logistic'
+        'tau_mm': 8.0,  # Gaussian: decay parameter in mm
+        't_mm': 8.0,    # Logistic: threshold in mm
+        's_mm': 3.0,    # Logistic: scale parameter in mm
+        'clamp_radius_factor': 3.0,  # Clamp soft targets to 0 beyond this factor * contact_threshold
+    }
+    
     # Paths
     PATHS = {
         'checkpoint_dir': './checkpoints',
         'log_dir': './logs',
         'output_dir': './outputs',
+        'qual_dir': './outputs/qualitative',  # Qualitative visualizations
     }
     
     
@@ -101,6 +117,8 @@ class Config:
         'val_interval': 100,  # Validate every N batches
         'num_val_samples': 50,  # Number of validation samples
         'num_poses_per_object': 4,  # M poses to generate per object
+        'num_qualitative': 3,  # Number of qualitative visualizations per validation
+        'save_gt_qualitative': True,  # Save ground-truth visualizations alongside predictions
     }
     
     @classmethod
@@ -125,6 +143,7 @@ class Config:
             'paths': copy.deepcopy(cls.PATHS),
             'eval': copy.deepcopy(cls.EVAL),
             'lora': copy.deepcopy(cls.LORA),
+            'regression_hparams': copy.deepcopy(cls.REGRESSION_HPARAMS),
         }
         
         # Override with CPU config if not using GPU

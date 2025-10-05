@@ -41,7 +41,9 @@ class FunctionalGraspModel(nn.Module):
         DPOSE: int = 63,
         K_CONTACT: int = 7,
         qwen_tuning: str = 'frozen',
-        lora_cfg: dict = None
+        lora_cfg: dict = None,
+        contact_regression: bool = True,
+        inference_threshold: float = 0.4
     ):
         """
         Args:
@@ -51,6 +53,8 @@ class FunctionalGraspModel(nn.Module):
             K_CONTACT: Number of contact classes
             qwen_tuning: Tuning mode for Qwen ('frozen', 'full', 'lora')
             lora_cfg: LoRA configuration dict (used when qwen_tuning='lora')
+            contact_regression: Use class-based regression (BCE) instead of classification (CE)
+            inference_threshold: Threshold for no_contact prediction in regression mode
         """
         super().__init__()
         
@@ -89,8 +93,10 @@ class FunctionalGraspModel(nn.Module):
             c_cond=CFUSE  # Conditioning is pooled fused features
         )
         
-        # Store dimensions
+        # Store dimensions and config
         self.DPOSE = DPOSE
+        self.contact_regression = contact_regression
+        self.inference_threshold = inference_threshold
 
     def forward_backbone(self, images_list, texts_list, pts):
         """
@@ -131,10 +137,19 @@ class FunctionalGraspModel(nn.Module):
         # Contact prediction
         logits_c = self.cm(f_fuse)  # [B, N, 7]
         
-        # Pooling: 1 - p(no_contact) for 7-way classification
-        probs = logits_c.softmax(dim=-1)  # [B, N, 7]
-        p_nc = probs[..., Config.NO_CONTACT_INDEX]  # [B, N]
-        w = 1.0 - p_nc  # [B, N]
+        # Pooling: branch based on contact_regression mode
+        if self.contact_regression:
+            # Regression mode: use max part probability as contactness
+            # logits_c[..., :6] are the 6 hand parts (thumb, index, middle, ring, little, palm)
+            part_probs = torch.sigmoid(logits_c[..., :6])  # [B, N, 6]
+            w = torch.max(part_probs, dim=-1)[0]  # [B, N] - max part probability
+        else:
+            # Classification mode: use 1 - p(no_contact)
+            probs = logits_c.softmax(dim=-1)  # [B, N, 7]
+            p_nc = probs[..., Config.NO_CONTACT_INDEX]  # [B, N]
+            w = 1.0 - p_nc  # [B, N]
+        
+        # Normalize weights and pool
         w = w / (w.sum(dim=1, keepdim=True) + 1e-6)
         z = (w.unsqueeze(-1) * f_fuse).sum(dim=1)  # [B, CFUSE]
         

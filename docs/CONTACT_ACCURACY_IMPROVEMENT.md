@@ -46,59 +46,60 @@
 ## Implementation plan (phased checklist)
 
 ### Phase 0 – Documentation scaffolding
-- [ ] Add this file and cross‑link it from `docs/pipeline.md` Monitoring/Evaluation sections.
-- [ ] In `docs/oakink.md`, expand contact approximation details (threshold/soft labels; near‑hand sampling rationale).
+- [x] Add this file and cross‑link it from `docs/pipeline.md` Monitoring/Evaluation sections.
+- [x] In `docs/oakink.md`, expand contact approximation details (threshold/soft labels; near‑hand sampling rationale).
+- [x] Update `docs/README.md` with new documentation structure.
 
 ### Phase 1 – Config + switches
-- [ ] Add flags to `config.py`:
+- [x] Add flags to `config.py`:
   - `MODEL`: `contact_regression: bool` (default: True), `inference_threshold: float` (default: 0.4)
   - `TRAINING`: `contact_loss_type: {'bce','ce'}` (default: 'bce'), `pos_weight: Optional[List[float]]` (computed from data)
   - `REGRESSION_HPARAMS`: `{label_type: 'gaussian'|'logistic', tau_mm: 8.0, t_mm: 8.0, s_mm: 3.0, clamp_radius_factor: 3.0}`
   - `EVAL`: `num_qualitative: int` (default: 3), `save_gt_qualitative: bool` (default: True)
   - `PATHS`: `qual_dir: str` (default: `./outputs/qualitative`)
   - `DATA`: `contact_aware_sampling: bool` (default: False), `contact_aware_ratio: float` (default: 0.5)
-- [ ] Wire flags through CLI overrides in `train.py` (add args for contact_regression, loss_type, tau_mm, inference_threshold).
+- [x] Wire flags through CLI overrides in `train.py` (add args for contact_regression, loss_type, tau_mm, inference_threshold).
 
 ### Phase 2 – Dataset: soft targets + caching
-- [ ] Add `_compute_soft_contact_targets()` method using `trimesh.proximity.closest_point(part_mesh, points)` for vectorized distance computation per part.
-- [ ] Map distances → soft targets `[N,7]`:
+- [x] Add `_compute_soft_contact_targets()` method using `trimesh.proximity.closest_point(part_mesh, points)` for vectorized distance computation per part.
+- [x] Map distances → soft targets `[N,7]`:
   - Parts 0‑5: Gaussian `s_j = exp(-(d_j/tau)^2)` or logistic `s_j = sigmoid((t-d_j)/s)`
   - Clamp to 0 beyond `clamp_radius_factor * contact_threshold` to bound influence
   - No‑contact: `s_nc = 1 - max(s_j for j in 0..5)`
-- [ ] Update `__getitem__()` to return both:
+- [x] Update `__getitem__()` to return both:
   - `contact_labels: LongTensor [1,N]` (existing, for CE)
   - `contact_targets: FloatTensor [1,N,7]` (new, for BCE) when config enables regression
-- [ ] Cache soft targets with key: `f"{frame_id}_soft_{label_type}_{tau_mm}_{threshold}.pkl"` in existing cache_dir.
-- [ ] Add `hand_vertices` to `batch['meta']` dict for GT visualization (currently computed but not returned).
-- [ ] On first epoch, compute and cache train set class frequencies to `cache_dir/class_frequencies_{split}.json`.
+- [x] Add `hand_vertices` to `batch['meta']` dict for GT visualization (currently computed but not returned).
+- [ ] Cache soft targets with key: `f"{frame_id}_soft_{label_type}_{tau_mm}_{threshold}.pkl"` in existing cache_dir. (Note: Currently computed on-the-fly; caching deferred for testing)
+- [ ] On first epoch, compute and cache train set class frequencies to `cache_dir/class_frequencies_{split}.json`. (Deferred: will compute after testing)
 
 ### Phase 3 – Model: pooling rule
-- [ ] Add `contact_regression` parameter to `FunctionalGraspModel.__init__()` and store as instance attribute for checkpoint compatibility.
-- [ ] In `forward_backbone()`, branch pooling logic based on `self.contact_regression`:
+- [x] Add `contact_regression` parameter to `FunctionalGraspModel.__init__()` and store as instance attribute for checkpoint compatibility.
+- [x] In `forward_backbone()`, branch pooling logic based on `self.contact_regression`:
   - If True: `w = torch.max(torch.sigmoid(logits_c[..., :6]), dim=-1)[0]` (max part probability)
   - If False: `w = 1 - softmax(logits_c)[..., 6]` (existing: 1 - p(no_contact))
-- [ ] Store `inference_threshold` as model attribute from config, used later in validation.
+- [x] Store `inference_threshold` as model attribute from config, used later in validation.
 
 ### Phase 4 – Training loss + metrics
-- [ ] Load cached class frequencies from Phase 2, compute `pos_weight = 1/sqrt(freq)` per class.
-- [ ] In `train_one_epoch()`, branch loss computation:
-  - BCE: `F.binary_cross_entropy_with_logits(logits_c, contact_targets, pos_weight=pos_weight.unsqueeze(0).unsqueeze(0))`
+- [ ] Load cached class frequencies from Phase 2, compute `pos_weight = 1/sqrt(freq)` per class. (Deferred: will compute after testing)
+- [x] In `train_one_epoch()`, branch loss computation:
+  - BCE: `F.binary_cross_entropy_with_logits(logits_c, contact_targets, pos_weight=pos_weight)`
   - CE: `F.cross_entropy(logits_c.view(B*N, 7), contact_labels.view(B*N))` (existing)
-- [ ] Add `compute_contact_predictions()` helper:
+- [x] Add `compute_contact_predictions()` helper:
   - Regression: `probs = sigmoid(logits[..., :6])`, predict class 6 if `max(probs) ≤ θ`, else `argmax(probs)`
   - CE: `argmax(logits)` (existing)
-- [ ] Add `compute_contact_metrics()` returning:
+- [x] Add `compute_contact_metrics()` returning:
   - Per‑class accuracy: `[acc_0, ..., acc_6]`
   - Macro‑F1: average of per‑class F1 scores
   - Confusion matrix: 7×7 numpy array
-- [ ] In `validate()`, compute and log these metrics to both `run.log` and TensorBoard.
-- [ ] Qualitative visualization in `validate()`:
+- [x] In `validate()`, compute and log these metrics to both `run.log` and TensorBoard.
+- [ ] Qualitative visualization in `validate()`: (Deferred to separate implementation)
   - Select first `cfg['eval']['num_qualitative']` samples from batch
   - For predictions: use `compute_contact_predictions()` + `model.sample()` for pose
   - For GT: use `batch['contact_labels']`, `batch['pose'].view(-1,21,3)`, `batch['meta'][i]['hand_vertices']`
   - Save figures to `cfg['paths']['qual_dir']` with descriptive names
   - Log file paths in logger with format: `Saved qualitative: {path}`
-- [ ] Update `visualize_training.py` to parse and plot macro‑F1 and per‑class accuracy from `run.log`.
+- [ ] Update `visualize_training.py` to parse and plot macro‑F1 and per‑class accuracy from `run.log`. (Deferred)
 
 ### Phase 5 – Contact‑aware sampling
 - [ ] In `OakInkDataset._load_object_points()`, add contact‑aware sampling when `cfg['data']['contact_aware_sampling']` is True:

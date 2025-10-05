@@ -18,6 +18,78 @@ from models.functional_grasp_model import FunctionalGraspModel
 from config import Config
 from dataset.oakink_loader import create_oakink_loaders
 
+import numpy as np
+from sklearn.metrics import f1_score, confusion_matrix
+
+
+def compute_contact_predictions(logits_c, contact_regression=True, inference_threshold=0.4):
+    """
+    Compute contact class predictions from logits.
+    
+    Args:
+        logits_c: [B, N, 7] contact logits
+        contact_regression: Whether using regression (BCE) or classification (CE)
+        inference_threshold: Threshold for no_contact in regression mode
+    
+    Returns:
+        predictions: [B, N] predicted class indices (0-6)
+    """
+    if contact_regression:
+        # Regression mode: use threshold on max part probability
+        part_probs = torch.sigmoid(logits_c[..., :6])  # [B, N, 6]
+        max_part_probs, max_part_indices = torch.max(part_probs, dim=-1)  # [B, N]
+        
+        # Predict no_contact (class 6) if max part prob <= threshold
+        predictions = torch.where(
+            max_part_probs <= inference_threshold,
+            torch.full_like(max_part_indices, 6),  # no_contact
+            max_part_indices  # predicted part
+        )
+    else:
+        # Classification mode: simple argmax
+        predictions = torch.argmax(logits_c, dim=-1)  # [B, N]
+    
+    return predictions
+
+
+def compute_contact_metrics(predictions, labels, num_classes=7):
+    """
+    Compute per-class accuracy, macro-F1, and confusion matrix.
+    
+    Args:
+        predictions: [B, N] predicted class indices
+        labels: [B, N] ground truth class indices
+        num_classes: Number of classes (default 7)
+    
+    Returns:
+        dict with metrics
+    """
+    # Flatten for sklearn
+    pred_flat = predictions.cpu().numpy().flatten()
+    label_flat = labels.cpu().numpy().flatten()
+    
+    # Per-class accuracy
+    per_class_acc = []
+    for c in range(num_classes):
+        mask = label_flat == c
+        if mask.sum() > 0:
+            acc = (pred_flat[mask] == c).mean()
+            per_class_acc.append(acc)
+        else:
+            per_class_acc.append(0.0)
+    
+    # Macro-F1
+    macro_f1 = f1_score(label_flat, pred_flat, average='macro', labels=list(range(num_classes)), zero_division=0)
+    
+    # Confusion matrix
+    conf_matrix = confusion_matrix(label_flat, pred_flat, labels=list(range(num_classes)))
+    
+    return {
+        'per_class_accuracy': per_class_acc,
+        'macro_f1': macro_f1,
+        'confusion_matrix': conf_matrix
+    }
+
 
 def compute_flow_matching_loss(model, conditioning, target_pose, bone_length_reg=0.0):
     """
@@ -138,13 +210,30 @@ def train_one_epoch(model, loader, optimizer, cfg, device, writer, global_step):
             pts=pts
         )
         
-        # Contact loss (7-way classification)
+        # Contact loss: branch based on loss type
         logits_c = out["logits_c"]  # [B, N, 7]
         B, N = logits_c.shape[:2]
-        loss_contact = F.cross_entropy(
-            logits_c.view(B * N, 7),
-            contact_labels.view(B * N)
-        )
+        
+        if cfg['training']['contact_loss_type'] == 'bce':
+            # BCE with logits for regression
+            contact_targets = batch["contact_targets"].to(device)  # [B, N, 7]
+            
+            # Compute pos_weight if available
+            pos_weight = cfg['training'].get('pos_weight', None)
+            if pos_weight is not None:
+                pos_weight = torch.tensor(pos_weight, dtype=torch.float32, device=device)
+            
+            loss_contact = F.binary_cross_entropy_with_logits(
+                logits_c, 
+                contact_targets,
+                pos_weight=pos_weight
+            )
+        else:
+            # CE for classification
+            loss_contact = F.cross_entropy(
+                logits_c.view(B * N, 7),
+                contact_labels.view(B * N)
+            )
         
         # Flow matching loss
         loss_flow = compute_flow_matching_loss(
@@ -179,7 +268,11 @@ def train_one_epoch(model, loader, optimizer, cfg, device, writer, global_step):
             
             # Contact accuracy
             with torch.no_grad():
-                pred_contacts = logits_c.argmax(-1)  # [B, N]
+                pred_contacts = compute_contact_predictions(
+                    logits_c,
+                    contact_regression=cfg['model']['contact_regression'],
+                    inference_threshold=cfg['model']['inference_threshold']
+                )
                 contact_acc = (pred_contacts == contact_labels).float().mean()
                 
                 if writer is not None:
@@ -198,7 +291,7 @@ def train_one_epoch(model, loader, optimizer, cfg, device, writer, global_step):
 
 def validate(model, loader, cfg, device, writer, global_step):
     """
-    Validate the model.
+    Validate the model with enhanced metrics.
     
     Args:
         model: FunctionalGraspModel
@@ -212,6 +305,7 @@ def validate(model, loader, cfg, device, writer, global_step):
         metrics: Dictionary of validation metrics
     """
     model.eval()
+    logger = logging.getLogger('funcgrasp')
     
     total_loss = 0
     total_contact_loss = 0
@@ -219,8 +313,12 @@ def validate(model, loader, cfg, device, writer, global_step):
     total_contact_acc = 0
     num_batches = 0
     
+    # Accumulate predictions and labels for metrics
+    all_predictions = []
+    all_labels = []
+    
     with torch.no_grad():
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
             # Move data to device
             pts = batch["points"].to(device)
             contact_labels = batch["contact_labels"].to(device)
@@ -236,10 +334,20 @@ def validate(model, loader, cfg, device, writer, global_step):
             # Losses
             logits_c = out["logits_c"]  # [B, N, 7]
             B, N = logits_c.shape[:2]
-            loss_contact = F.cross_entropy(
-                logits_c.view(B * N, 7),
-                contact_labels.view(B * N)
-            )
+            
+            if cfg['training']['contact_loss_type'] == 'bce':
+                contact_targets = batch["contact_targets"].to(device)
+                pos_weight = cfg['training'].get('pos_weight', None)
+                if pos_weight is not None:
+                    pos_weight = torch.tensor(pos_weight, dtype=torch.float32, device=device)
+                loss_contact = F.binary_cross_entropy_with_logits(
+                    logits_c, contact_targets, pos_weight=pos_weight
+                )
+            else:
+                loss_contact = F.cross_entropy(
+                    logits_c.view(B * N, 7),
+                    contact_labels.view(B * N)
+                )
             
             loss_flow = compute_flow_matching_loss(
                 model,
@@ -250,16 +358,29 @@ def validate(model, loader, cfg, device, writer, global_step):
             loss = (cfg['training']['lambda_contact'] * loss_contact + 
                    cfg['training']['lambda_flow'] * loss_flow)
             
-            # Metrics
-            pred_contacts = logits_c.argmax(-1)  # [B, N]
+            # Predictions
+            pred_contacts = compute_contact_predictions(
+                logits_c,
+                contact_regression=cfg['model']['contact_regression'],
+                inference_threshold=cfg['model']['inference_threshold']
+            )
             contact_acc = (pred_contacts == contact_labels).float().mean()
             
-            # Accumulate
+            # Accumulate for metrics
+            all_predictions.append(pred_contacts)
+            all_labels.append(contact_labels)
+            
+            # Accumulate losses
             total_loss += loss.item()
             total_contact_loss += loss_contact.item()
             total_flow_loss += loss_flow.item()
             total_contact_acc += contact_acc.item()
             num_batches += 1
+    
+    # Compute enhanced metrics
+    all_predictions = torch.cat(all_predictions, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+    contact_metrics = compute_contact_metrics(all_predictions, all_labels)
     
     # Average metrics
     metrics = {
@@ -267,12 +388,29 @@ def validate(model, loader, cfg, device, writer, global_step):
         'val_contact_loss': total_contact_loss / num_batches,
         'val_flow_loss': total_flow_loss / num_batches,
         'val_contact_acc': total_contact_acc / num_batches,
+        'val_macro_f1': contact_metrics['macro_f1'],
+        'val_per_class_acc': contact_metrics['per_class_accuracy'],
+        'val_confusion_matrix': contact_metrics['confusion_matrix']
     }
+    
+    # Log to run.log
+    logger.info(f"Validation at step {global_step}:")
+    logger.info(f"  Loss: {metrics['val_loss']:.4f} | Contact: {metrics['val_contact_loss']:.4f} | Flow: {metrics['val_flow_loss']:.4f}")
+    logger.info(f"  Overall Acc: {metrics['val_contact_acc']:.4f} | Macro-F1: {metrics['val_macro_f1']:.4f}")
+    logger.info(f"  Per-class Acc: {[f'{a:.3f}' for a in metrics['val_per_class_acc']]}")
+    logger.info(f"  Confusion Matrix:\n{metrics['val_confusion_matrix']}")
     
     # Log to tensorboard
     if writer is not None:
-        for key, value in metrics.items():
-            writer.add_scalar(f'Validation/{key}', value, global_step)
+        writer.add_scalar('Validation/val_loss', metrics['val_loss'], global_step)
+        writer.add_scalar('Validation/val_contact_loss', metrics['val_contact_loss'], global_step)
+        writer.add_scalar('Validation/val_flow_loss', metrics['val_flow_loss'], global_step)
+        writer.add_scalar('Validation/val_contact_acc', metrics['val_contact_acc'], global_step)
+        writer.add_scalar('Validation/val_macro_f1', metrics['val_macro_f1'], global_step)
+        
+        # Log per-class accuracy
+        for i, acc in enumerate(metrics['val_per_class_acc']):
+            writer.add_scalar(f'Validation/per_class_acc_{Config.CONTACT_CLASSES[i]}', acc, global_step)
     
     return metrics
 
@@ -339,6 +477,19 @@ def main():
     
     parser.add_argument('--log_interval', type=int, default=None,
                         help='Batches between console/TensorBoard logs')
+    
+    # Contact regression arguments
+    parser.add_argument('--contact_regression', action='store_true',
+                        help='Use contact regression (BCE) instead of classification (CE)')
+    parser.add_argument('--no_contact_regression', dest='contact_regression', action='store_false',
+                        help='Use classification (CE) instead of regression (BCE)')
+    parser.add_argument('--contact_loss_type', type=str, default=None,
+                        choices=['bce', 'ce'],
+                        help='Contact loss type (bce or ce)')
+    parser.add_argument('--inference_threshold', type=float, default=None,
+                        help='Threshold for no_contact prediction in regression mode')
+    parser.add_argument('--tau_mm', type=float, default=None,
+                        help='Gaussian decay parameter for soft targets (mm)')
 
     args = parser.parse_args()
     
@@ -374,6 +525,16 @@ def main():
         cfg['lora']['bias'] = args.lora_bias
     if args.lora_use_8bit:
         cfg['lora']['use_8bit'] = True
+    
+    # Override contact regression settings
+    if hasattr(args, 'contact_regression') and args.contact_regression is not None:
+        cfg['model']['contact_regression'] = args.contact_regression
+    if args.contact_loss_type:
+        cfg['training']['contact_loss_type'] = args.contact_loss_type
+    if args.inference_threshold is not None:
+        cfg['model']['inference_threshold'] = args.inference_threshold
+    if args.tau_mm is not None:
+        cfg['regression_hparams']['tau_mm'] = args.tau_mm
     
     # Initialize logging to file (run.log)
     os.makedirs(cfg['paths']['log_dir'], exist_ok=True)
@@ -429,7 +590,9 @@ def main():
         n_points=cfg['model']['n_points'],
         contact_threshold=cfg['data']['contact_threshold'],
         num_views=num_views,
-        use_cache=cfg['data']['use_cache']
+        use_cache=cfg['data']['use_cache'],
+        use_soft_targets=cfg['model']['contact_regression'],
+        regression_hparams=cfg['regression_hparams']
     )
     
     # Model
@@ -440,7 +603,9 @@ def main():
         DPOSE=cfg['model']['DPOSE'],
         K_CONTACT=cfg['model']['K_CONTACT'],
         qwen_tuning=cfg['model']['qwen_tuning'],
-        lora_cfg=cfg['lora'] if cfg['model']['qwen_tuning'] == 'lora' else None
+        lora_cfg=cfg['lora'] if cfg['model']['qwen_tuning'] == 'lora' else None,
+        contact_regression=cfg['model']['contact_regression'],
+        inference_threshold=cfg['model']['inference_threshold']
     ).to(device)
     
     # Count parameters

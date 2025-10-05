@@ -375,7 +375,9 @@ def render_object_open3d(mesh_path, output_dir):
 - ✅ **Point Clouds**: Generated from meshes via FPS
 - ✅ **Text Instructions**: Generated from semantic attributes
 - ✅ **Hand Poses**: 21 joints available and transformed to object frame (63D)
-- ✅ **Contact Labels**: 7-way finger/palm labels via MANO mesh proximity with 1cm threshold
+- ✅ **Contact Labels**: 7-way finger/palm labels via MANO mesh proximity (configurable threshold, default 8mm)
+  - **Hard labels** (classification): Nearest-part assignment for CE loss
+  - **Soft targets** (regression): Distance-shaped scores per part for BCE loss
 - ✅ **Object Images**: Rendered multi-view images implemented under `dataset/prepare_data.py`
 - ✅ **Loader Robustness**: During training, sequences with missing rendered images are filtered out to keep the pipeline running with partial renders.
 
@@ -408,3 +410,75 @@ This dataset supports training with:
 1. Rendered object images (multi-view) for semantics
 2. 63D joint poses in object frame
 3. 7-way finger/palm contact labels derived from MANO mesh proximity
+   - Hard labels `[N]` for classification (CE loss)
+   - Soft targets `[N, 7]` for regression (BCE loss)
+   - Configurable distance-to-score mapping (Gaussian or logistic)
+
+## Contact Label Computation
+
+### Overview
+Contact labels are computed from MANO hand mesh topology and point-to-mesh distances. Two modes are supported:
+
+1. **Hard Labels (Classification)**: Nearest-part assignment with threshold
+2. **Soft Targets (Regression)**: Distance-shaped scores per part
+
+### Hard Label Computation (`_compute_contact_labels_mano`)
+
+**Process**:
+1. Assign MANO vertices to 6 hand parts (thumb, index, middle, ring, little, palm) using skinning weights
+2. Build part submeshes from MANO topology
+3. For each object point, compute distance to each part mesh
+4. Assign point to nearest part if distance < threshold, else `no_contact`
+
+**Output**: `[N]` integer labels (0-6)
+- 0-4: Finger parts (thumb, index, middle, ring, little)
+- 5: Palm
+- 6: No contact
+
+**Configuration**:
+- `contact_threshold`: Distance threshold in meters (default: 0.008 = 8mm)
+
+### Soft Target Computation (`_compute_soft_contact_targets`)
+
+**Process**:
+1. Build part submeshes (same as hard labels)
+2. Vectorized distance computation: `trimesh.nearest.on_surface(points)` per part
+3. Map distances to scores using configurable function:
+   - **Gaussian**: `s_j = exp(-(d_j/tau)^2)`
+   - **Logistic**: `s_j = sigmoid((t - d_j) / s)`
+4. Clamp scores to 0 beyond `clamp_radius_factor * contact_threshold`
+5. Compute no-contact score: `s_nc = 1 - max(s_0, ..., s_5)`
+
+**Output**: `[N, 7]` float targets in [0, 1]
+- Channels 0-5: Per-part contact scores
+- Channel 6: No-contact score
+
+**Configuration** (`REGRESSION_HPARAMS`):
+- `label_type`: 'gaussian' or 'logistic'
+- `tau_mm`: Gaussian decay parameter (default: 8.0 mm)
+- `t_mm`, `s_mm`: Logistic threshold and scale (default: 8.0, 3.0 mm)
+- `clamp_radius_factor`: Distance clamp multiplier (default: 3.0)
+
+### Benefits of Soft Targets
+
+1. **Reduced boundary noise**: Smooth transitions near threshold
+2. **Better calibration**: Independent per-part probabilities
+3. **Informative gradients**: Graded targets for near-contact points
+4. **Class imbalance handling**: Per-channel `pos_weight` in BCE loss
+
+### Usage in Training
+
+```python
+# Dataset returns both formats
+batch = dataset[idx]
+hard_labels = batch['contact_labels']  # [B, N] for CE
+soft_targets = batch['contact_targets']  # [B, N, 7] for BCE
+
+# Training loop branches on loss type
+if cfg['training']['contact_loss_type'] == 'bce':
+    loss = F.binary_cross_entropy_with_logits(logits, soft_targets, pos_weight=...)
+else:
+    loss = F.cross_entropy(logits.view(-1, 7), hard_labels.view(-1))
+```
+
+See `docs/CONTACT_ACCURACY_IMPROVEMENT.md` for full implementation details.

@@ -507,7 +507,38 @@ tensorboard --logdir ./logs
 
 ## I. Evaluation & Metrics
 
-### I.1 Evaluation Metrics
+> **See also**: [CONTACT_ACCURACY_IMPROVEMENT.md](CONTACT_ACCURACY_IMPROVEMENT.md) for enhanced contact metrics and class-based regression approach.
+
+### I.1 Contact Prediction Metrics
+
+**Basic Metrics** (always computed):
+- Overall accuracy: `(predictions == labels).mean()`
+- Contact loss: BCE (regression) or CE (classification)
+
+**Enhanced Metrics** (validation only):
+- **Per-class accuracy**: Accuracy for each of 7 classes (thumb, index, middle, ring, little, palm, no_contact)
+- **Macro-F1**: Average F1 score across all classes (prevents no_contact dominance)
+- **Confusion matrix**: 7×7 matrix showing misclassification patterns
+
+**Prediction Rule**:
+- **Regression mode**: Predict `no_contact` if `max(sigmoid(parts)) ≤ θ`, else `argmax(parts)`
+- **Classification mode**: `argmax(logits)`
+
+```python
+# Enhanced validation metrics
+from train import compute_contact_predictions, compute_contact_metrics
+
+predictions = compute_contact_predictions(
+    logits_c, 
+    contact_regression=cfg['model']['contact_regression'],
+    inference_threshold=cfg['model']['inference_threshold']
+)
+
+metrics = compute_contact_metrics(predictions, labels)
+# Returns: per_class_accuracy, macro_f1, confusion_matrix
+```
+
+### I.2 Pose Evaluation Metrics
 
 ```python
 def evaluate_grasp(model, images, text, pts, gt_pose, gt_contact_labels):
@@ -516,19 +547,15 @@ def evaluate_grasp(model, images, text, pts, gt_pose, gt_contact_labels):
     
     # Pose error (MSE)
     with torch.no_grad():
-        _, _, cond = model.forward_backbone([images], [text], pts.unsqueeze(0))
-        # Sample a pose via flow matching sampler (or do teacher-forced one-step for speed)
         pred_pose = model.sample([images], [text], pts.unsqueeze(0), num_steps=20, device=pts.device)
     metrics['pose_error'] = F.mse_loss(pred_pose, gt_pose.unsqueeze(0)).item()
     
-    # Contact prediction IoU
+    # Contact prediction metrics
     with torch.no_grad():
         _, logits_c, _ = model.forward_backbone([images], [text], pts.unsqueeze(0))
-        pred_contacts = logits_c.argmax(-1).squeeze(0)  # [N]
-    metrics['contact_iou'] = compute_iou(pred_contacts, gt_contact_labels)
-    
-    # Optional: functional success proxy
-    # metrics['grasp_stability'] = check_force_closure(pred_pose, pts)
+        pred_contacts = compute_contact_predictions(logits_c, ...)
+    contact_metrics = compute_contact_metrics(pred_contacts, gt_contact_labels)
+    metrics.update(contact_metrics)
     
     return metrics
 ```
