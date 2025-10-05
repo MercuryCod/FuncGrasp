@@ -66,21 +66,32 @@ class OakInkDataset(Dataset):
 
         
         # Load split sequences
+        print(f"Loading split file: {split_mode}/{split}...")
+        import sys
+        sys.stdout.flush()
         split_file = self.root_dir / "image" / "anno" / "split" / split_mode / f"seq_{split}.json"
         with open(split_file, 'r') as f:
             all_sequences = json.load(f)
+        print(f"Loaded {len(all_sequences)} sequences from split file")
+        sys.stdout.flush()
         
         # Load object metadata
+        print("Loading object metadata...")
+        sys.stdout.flush()
         meta_file = self.root_dir / "shape" / "metaV2" / "object_id.json"
         with open(meta_file, 'r') as f:
             self.object_meta = json.load(f)
+        print(f"Loaded metadata for {len(self.object_meta)} objects")
+        sys.stdout.flush()
         
         # Filter sequences to only include those with rendered images
         print(f"Filtering sequences for available rendered images...")
+        sys.stdout.flush()
+        from tqdm import tqdm
         self.sequences = []
         missing_objects = set()
         
-        for seq in all_sequences:
+        for seq in tqdm(all_sequences, desc="Checking rendered images", unit="seq"):
             # Extract object ID from sequence
             seq_id = seq[0] if isinstance(seq, list) else seq
             obj_id = self._get_object_id(seq_id)
@@ -107,7 +118,7 @@ class OakInkDataset(Dataset):
         from collections import defaultdict
         seq_groups = defaultdict(list)
         
-        for seq in self.sequences:
+        for seq in tqdm(self.sequences, desc="Grouping sequences", unit="seq"):
             seq_id, timestamp, _, _ = seq  # frame_idx and view_idx used in seq itself
             # Group by (seq_id, timestamp) to identify unique grasp sequences
             key = (seq_id, timestamp)
@@ -133,9 +144,11 @@ class OakInkDataset(Dataset):
         
         
         # Load MANO topology (once per dataset)
+        print("Loading MANO topology...")
         self.mano_faces, self.mano_weights, self.mano_kintree = self._load_mano_topology(
             mano_model_path=Config.DATA.get('mano_model_path', 'assets/mano_v1_2/models/MANO_RIGHT.pkl')
         )
+        print("MANO topology loaded successfully!")
         
         # Cache directory for multiclass contact labels
         self.cache_dir = self.root_dir / "cache" / split_mode / split
