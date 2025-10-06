@@ -16,10 +16,27 @@ This directory contains the technical documentation for the FuncGrasp project.
 2. **[oakink.md](oakink.md)** - Dataset Documentation
    - OakInk dataset structure
    - Data loading pipeline
-   - Contact approximation method
+   - Contact approximation method (hard labels and soft targets)
    - Semantic attribute mapping
 
+3. **[CONTACT_ACCURACY_IMPROVEMENT.md](CONTACT_ACCURACY_IMPROVEMENT.md)** - Contact Accuracy Enhancement Plan
+   - Problem analysis and root causes
+   - Class-based regression approach
+   - Implementation plan (Phases 0-6)
+   - Configuration and hyperparameters
+
 ### Supporting Documents
+
+3. **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)** - Implementation Status
+   - What was implemented (Phases 1-4)
+   - Design decisions and trade-offs
+   - Deferred features
+   - Usage examples
+
+4. **[TESTING_CHECKLIST.md](TESTING_CHECKLIST.md)** - Testing Guide
+   - Testing tasks for each phase
+   - Verification steps
+   - Known issues
 
 4. **[../CLAUDE.md](../CLAUDE.md)** - AI Assistant Context
    - Project overview for AI assistants
@@ -38,6 +55,14 @@ This directory contains the technical documentation for the FuncGrasp project.
 
 ## Recent Updates
 
+### Contact Accuracy Improvements (Latest)
+- **Class-based regression**: Switched from hard 7-way classification to soft, distance-shaped targets trained with BCE-with-logits
+- **Enhanced metrics**: Added per-class accuracy, macro-F1, and confusion matrix logging
+- **Configurable modes**: Can switch between regression (BCE) and classification (CE) via config
+- **Improved pooling**: Regression mode uses `max(sigmoid(parts))` as contactness
+- See `CONTACT_ACCURACY_IMPROVEMENT.md` for full details
+
+### Previous Updates
 - Qwen2.5‑VL (3B) is always trainable; the semantics encoder returns hidden states `[B, L_max, 2048]` for single text with multiple images. Pooling/projection to `CSEM` happens inside `FunctionalGraspModel`.
 - Custom PointNet++ encoders (SSG/MSG) implemented with PyG primitives. See `pointnet2.md`.
    - Architecture and parameterization
@@ -79,9 +104,16 @@ This directory contains the technical documentation for the FuncGrasp project.
 - **Audience**: Users preparing or understanding training data
 - **Key Sections**: OakInk structure, data loading, preprocessing
 
-## Recent Updates
+## Implementation Status
 
-- **Semantics Batching**: Qwen2.5‑VL returns hidden states `[B, L_max, 2048]` (batched text+images). Pooling/projection to `CSEM` happens inside `FunctionalGraspModel`.
-- **Contact Prediction**: 7‑way finger/palm contact classification with pooling via `1 − p(no_contact)`
-- **PointNet++ Backbone**: Uses PyTorch Geometric PointNet2 (required dependency)
-- **Repository Restructure**: Flattened directory structure; models live under top-level `models/`
+### Contact Prediction
+- **Current**: Class-based regression with soft targets (BCE-with-logits)
+- **Fallback**: 7-way classification (CE) available via config
+- **Pooling**: Regression uses `max(sigmoid(parts))`, classification uses `1 − p(no_contact)`
+- **Metrics**: Per-class accuracy, macro-F1, confusion matrix
+
+### Model Components
+- **Semantics**: Qwen2.5-VL returns `[B, L_max, 2048]` hidden states; pooled/projected to CSEM in model
+- **Geometry**: PyTorch Geometric PointNet2 (SSG/MSG variants)
+- **Fusion**: Transformer across points with tiled semantic features
+- **Flow Matching**: Rectified flow for pose generation

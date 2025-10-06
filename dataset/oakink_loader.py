@@ -38,7 +38,9 @@ class OakInkDataset(Dataset):
         use_cache: bool = True,
         num_views: int = 3,  # Number of object views to use
         semantic_prompts: Optional[Dict] = None,
-        transform_to_object_frame: bool = True
+        transform_to_object_frame: bool = True,
+        use_soft_targets: bool = True,  # Use soft regression targets
+        regression_hparams: Optional[Dict] = None  # Regression hyperparameters
     ):
         """
         Args:
@@ -52,6 +54,8 @@ class OakInkDataset(Dataset):
             num_views: Number of object views to use (1-6)
             semantic_prompts: Dict mapping object IDs to functional descriptions
             transform_to_object_frame: Whether to transform to object frame
+            use_soft_targets: Whether to compute soft regression targets
+            regression_hparams: Regression hyperparameters dict
         """
         self.root_dir = Path(root_dir)
         self.render_dir = Path(render_dir)
@@ -62,25 +66,44 @@ class OakInkDataset(Dataset):
         self.num_views = min(num_views, len(self.OBJECT_VIEWS))
         self.semantic_prompts = semantic_prompts or {}
         self.transform_to_object_frame = transform_to_object_frame
+        self.use_soft_targets = use_soft_targets
+        self.regression_hparams = regression_hparams or {
+            'label_type': 'gaussian',
+            'tau_mm': 8.0,
+            't_mm': 8.0,
+            's_mm': 3.0,
+            'clamp_radius_factor': 3.0
+        }
         
 
         
         # Load split sequences
+        print(f"Loading split file: {split_mode}/{split}...")
+        import sys
+        sys.stdout.flush()
         split_file = self.root_dir / "image" / "anno" / "split" / split_mode / f"seq_{split}.json"
         with open(split_file, 'r') as f:
             all_sequences = json.load(f)
+        print(f"Loaded {len(all_sequences)} sequences from split file")
+        sys.stdout.flush()
         
         # Load object metadata
+        print("Loading object metadata...")
+        sys.stdout.flush()
         meta_file = self.root_dir / "shape" / "metaV2" / "object_id.json"
         with open(meta_file, 'r') as f:
             self.object_meta = json.load(f)
+        print(f"Loaded metadata for {len(self.object_meta)} objects")
+        sys.stdout.flush()
         
         # Filter sequences to only include those with rendered images
         print(f"Filtering sequences for available rendered images...")
+        sys.stdout.flush()
+        from tqdm import tqdm
         self.sequences = []
         missing_objects = set()
         
-        for seq in all_sequences:
+        for seq in tqdm(all_sequences, desc="Checking rendered images", unit="seq"):
             # Extract object ID from sequence
             seq_id = seq[0] if isinstance(seq, list) else seq
             obj_id = self._get_object_id(seq_id)
@@ -102,11 +125,42 @@ class OakInkDataset(Dataset):
         if len(self.sequences) == 0:
             raise ValueError(f"No sequences found with rendered images in {self.render_dir}")
         
+        # Filter to final grasp frames only (last frame per sequence)
+        print(f"Filtering to final grasp frames (last frame per sequence)...")
+        from collections import defaultdict
+        seq_groups = defaultdict(list)
+        
+        for seq in tqdm(self.sequences, desc="Grouping sequences", unit="seq"):
+            seq_id, timestamp, _, _ = seq  # frame_idx and view_idx used in seq itself
+            # Group by (seq_id, timestamp) to identify unique grasp sequences
+            key = (seq_id, timestamp)
+            seq_groups[key].append(seq)
+        
+        # Keep only the last frame (max frame_idx) of each sequence, with view 0
+        final_sequences = []
+        for key, frames in seq_groups.items():
+            # Find maximum frame index
+            max_frame_idx = max(f[2] for f in frames)
+            # Get all frames at max_frame_idx
+            final_frames = [f for f in frames if f[2] == max_frame_idx]
+            # Prefer view 0, fallback to first available view
+            view_0_frames = [f for f in final_frames if f[3] == 0]
+            if view_0_frames:
+                final_sequences.append(view_0_frames[0])
+            elif final_frames:
+                final_sequences.append(final_frames[0])
+        
+        print(f"Final grasp filtering: {len(self.sequences)} frames -> {len(final_sequences)} final grasps")
+        print(f"  Unique grasp sequences: {len(seq_groups)}")
+        self.sequences = final_sequences
+        
         
         # Load MANO topology (once per dataset)
+        print("Loading MANO topology...")
         self.mano_faces, self.mano_weights, self.mano_kintree = self._load_mano_topology(
             mano_model_path=Config.DATA.get('mano_model_path', 'assets/mano_v1_2/models/MANO_RIGHT.pkl')
         )
+        print("MANO topology loaded successfully!")
         
         # Cache directory for multiclass contact labels
         self.cache_dir = self.root_dir / "cache" / split_mode / split
@@ -165,6 +219,19 @@ class OakInkDataset(Dataset):
         # Compute 7-way contact labels using MANO hand mesh (preferred)
         contact_labels = self._compute_contact_labels_mano(hand_vertices, hand_joints, points)
         
+        # Compute soft contact targets if enabled
+        contact_targets = None
+        if self.use_soft_targets:
+            contact_targets = self._compute_soft_contact_targets(
+                hand_vertices, 
+                points,
+                label_type=self.regression_hparams['label_type'],
+                tau_mm=self.regression_hparams['tau_mm'],
+                t_mm=self.regression_hparams['t_mm'],
+                s_mm=self.regression_hparams['s_mm'],
+                clamp_radius_factor=self.regression_hparams['clamp_radius_factor']
+            )
+        
         # Generate semantic prompt
         text = self._generate_prompt(obj_id, seq_id)
         
@@ -183,9 +250,14 @@ class OakInkDataset(Dataset):
                 "seq_id": seq_id,
                 "frame_idx": frame_idx,
                 "obj_id": obj_id,
-                "obj_transform": obj_transform
+                "obj_transform": obj_transform,
+                "hand_vertices": hand_vertices  # Add for GT visualization
             }
         }
+        
+        # Add soft targets if computed
+        if contact_targets is not None:
+            batch["contact_targets"] = torch.tensor(contact_targets, dtype=torch.float32).unsqueeze(0)  # [1, N, 7]
         
         # Cache processed data
         if self.use_cache:
@@ -512,6 +584,97 @@ class OakInkDataset(Dataset):
         
         return labels
     
+    def _compute_soft_contact_targets(
+        self, 
+        hand_vertices: np.ndarray, 
+        points: np.ndarray,
+        label_type: str = 'gaussian',
+        tau_mm: float = 8.0,
+        t_mm: float = 8.0,
+        s_mm: float = 3.0,
+        clamp_radius_factor: float = 3.0
+    ) -> np.ndarray:
+        """
+        Compute soft contact targets using distance-shaped scores per hand part.
+        
+        Args:
+            hand_vertices: (778, 3) MANO vertices in object frame
+            points: (N, 3) object points in object frame
+            label_type: 'gaussian' or 'logistic'
+            tau_mm: Gaussian decay parameter in mm
+            t_mm: Logistic threshold in mm
+            s_mm: Logistic scale parameter in mm
+            clamp_radius_factor: Clamp to 0 beyond this factor * contact_threshold
+            
+        Returns:
+            targets: (N, 7) array with soft targets in [0,1] for each class
+        """
+        # Assign vertices to parts
+        part_assignment = self._assign_vertex_parts(self.mano_weights, self.mano_kintree)
+        
+        # Build part submeshes (reuse logic from _compute_contact_labels_mano)
+        part_meshes = []
+        for part_id in range(6):  # 0..5 (thumb/index/middle/ring/little/palm)
+            part_vertex_mask = (part_assignment == part_id)
+            if not np.any(part_vertex_mask):
+                raise ValueError(f"No vertices assigned to part {part_id} ({Config.CONTACT_CLASSES[part_id]})")
+            
+            part_vertices = hand_vertices[part_vertex_mask]
+            
+            # Filter faces
+            valid_faces = []
+            vertex_indices = np.where(part_vertex_mask)[0]
+            vertex_set = set(vertex_indices)
+            
+            for face in self.mano_faces:
+                if all(v in vertex_set for v in face):
+                    local_face = [np.where(vertex_indices == v)[0][0] for v in face]
+                    valid_faces.append(local_face)
+            
+            if len(valid_faces) == 0:
+                raise ValueError(f"No valid faces for part {part_id} ({Config.CONTACT_CLASSES[part_id]})")
+            
+            part_mesh = trimesh.Trimesh(vertices=part_vertices, faces=np.asarray(valid_faces), process=False)
+            part_meshes.append(part_mesh)
+        
+        # Compute distances from object points to each part mesh (vectorized per part)
+        N = len(points)
+        part_distances = np.zeros((N, 6), dtype=np.float32)  # (N, 6) for 6 parts
+        
+        for part_id, part_mesh in enumerate(part_meshes):
+            # Vectorized distance computation for all points to this part
+            _, distances, _ = part_mesh.nearest.on_surface(points)
+            part_distances[:, part_id] = distances
+        
+        # Convert meters to mm for threshold comparison
+        part_distances_mm = part_distances * 1000.0
+        
+        # Clamp distances beyond clamp_radius
+        clamp_radius_mm = clamp_radius_factor * self.contact_threshold * 1000.0
+        part_distances_mm = np.minimum(part_distances_mm, clamp_radius_mm)
+        
+        # Map distances to soft scores
+        if label_type == 'gaussian':
+            # Gaussian: s_j = exp(-(d_j/tau)^2)
+            part_scores = np.exp(-(part_distances_mm / tau_mm) ** 2)
+        elif label_type == 'logistic':
+            # Logistic: s_j = sigmoid((t - d_j) / s)
+            part_scores = 1.0 / (1.0 + np.exp(-(t_mm - part_distances_mm) / s_mm))
+        else:
+            raise ValueError(f"Unknown label_type: {label_type}")
+        
+        # Clamp scores to 0 for distances beyond clamp radius
+        part_scores[part_distances_mm >= clamp_radius_mm] = 0.0
+        
+        # Compute no_contact score: 1 - max(part_scores)
+        max_part_scores = np.max(part_scores, axis=1, keepdims=True)  # (N, 1)
+        no_contact_scores = 1.0 - max_part_scores  # (N, 1)
+        
+        # Concatenate to get (N, 7) targets
+        targets = np.concatenate([part_scores, no_contact_scores], axis=1)  # (N, 7)
+        
+        return targets.astype(np.float32)
+    
     def _generate_prompt(self, obj_id: str, seq_id: str) -> str:
         """Generate functional description for the object."""
         if obj_id in self.semantic_prompts:
@@ -651,6 +814,9 @@ def create_oakink_loaders(
             'pose': torch.cat([item['pose'] for item in batch_list], dim=0),
             'meta': [item['meta'] for item in batch_list]
         }
+        # Add contact_targets if present
+        if 'contact_targets' in batch_list[0]:
+            batch['contact_targets'] = torch.cat([item['contact_targets'] for item in batch_list], dim=0)
         return batch
 
     # Create data loaders
