@@ -1,5 +1,9 @@
 ## Contact accuracy plateau: problem, approach, and implementation plan
 
+> **Status**: ✅ Implementation complete. Ready for testing with data at `/mnt/data/OakInk`.  
+> **Quick start**: Run `bash scripts/setup_training.sh` then `bash scripts/train.sh`.  
+> **Documentation**: This is the single source of truth for the contact accuracy improvement pipeline.
+
 ### Problem
 - Validation contact accuracy saturates around 85–88% while training accuracy keeps rising. Total/flow losses continue to improve, so the bottleneck is specific to the contact head/data rather than overall optimization.
 
@@ -36,102 +40,195 @@
 
 ### Sampling and labeling
 - **Contact‑aware point sampling**: mix near‑hand points (e.g., within 2× the contact threshold to any MANO vertex) with uniform surface points; recommended 50/50.
-- **Label refinement**:
-  - Reduce the threshold from 10 mm to 5–8 mm to lessen boundary ambiguity.
-  - Optionally use **soft labels** within a boundary band (e.g., 5–15 mm) to reduce flips near the threshold.
+- **Label policy**:
+  - We standardize the contact threshold at **10 mm**.
+  - Optionally use **soft labels** within a boundary band (e.g., 5–15 mm) for analysis; however training will use the distance‑shaped soft targets (regression mode) and 10 mm hard threshold (classification fallback).
   - For regression, compute and (optionally) cache per‑part nearest distances for soft targets; clamp to zero beyond a radius (e.g., 3× threshold) to bound influence.
 
 <!-- Removed former points 4 and 5 per review: data/conditioning diversity and eval/checkpoint cadence -->
 
-## Implementation plan (phased checklist)
+## Implementation plan (status-aware, single source of truth)
 
-### Phase 0 – Documentation scaffolding
-- [x] Add this file and cross‑link it from `docs/pipeline.md` Monitoring/Evaluation sections.
-- [x] In `docs/oakink.md`, expand contact approximation details (threshold/soft labels; near‑hand sampling rationale).
-- [x] Update `docs/README.md` with new documentation structure.
+This section consolidates implementation status, testing steps, and the remaining work. Data is now available at `/mnt/data`.
 
-### Phase 1 – Config + switches
-- [x] Add flags to `config.py`:
-  - `MODEL`: `contact_regression: bool` (default: True), `inference_threshold: float` (default: 0.4)
-  - `TRAINING`: `contact_loss_type: {'bce','ce'}` (default: 'bce'), `pos_weight: Optional[List[float]]` (computed from data)
-  - `REGRESSION_HPARAMS`: `{label_type: 'gaussian'|'logistic', tau_mm: 8.0, t_mm: 8.0, s_mm: 3.0, clamp_radius_factor: 3.0}`
-  - `EVAL`: `num_qualitative: int` (default: 3), `save_gt_qualitative: bool` (default: True)
-  - `PATHS`: `qual_dir: str` (default: `./outputs/qualitative`)
-  - `DATA`: `contact_aware_sampling: bool` (default: False), `contact_aware_ratio: float` (default: 0.5)
-- [x] Wire flags through CLI overrides in `train.py` (add args for contact_regression, loss_type, tau_mm, inference_threshold).
+### A. Current status at a glance
 
-### Phase 2 – Dataset: soft targets + caching
-- [x] Add `_compute_soft_contact_targets()` method using `trimesh.proximity.closest_point(part_mesh, points)` for vectorized distance computation per part.
-- [x] Map distances → soft targets `[N,7]`:
-  - Parts 0‑5: Gaussian `s_j = exp(-(d_j/tau)^2)` or logistic `s_j = sigmoid((t-d_j)/s)`
-  - Clamp to 0 beyond `clamp_radius_factor * contact_threshold` to bound influence
-  - No‑contact: `s_nc = 1 - max(s_j for j in 0..5)`
-- [x] Update `__getitem__()` to return both:
-  - `contact_labels: LongTensor [1,N]` (existing, for CE)
-  - `contact_targets: FloatTensor [1,N,7]` (new, for BCE) when config enables regression
-- [x] Add `hand_vertices` to `batch['meta']` dict for GT visualization (currently computed but not returned).
-- [ ] Cache soft targets with key: `f"{frame_id}_soft_{label_type}_{tau_mm}_{threshold}.pkl"` in existing cache_dir. (Note: Currently computed on-the-fly; caching deferred for testing)
-- [ ] On first epoch, compute and cache train set class frequencies to `cache_dir/class_frequencies_{split}.json`. (Deferred: will compute after testing)
+- Core BCE/CE dual‑mode pipeline is integrated and config‑gated.
+- Dataset returns both hard labels `[B,N]` and soft targets `[B,N,7]`.
+- Model pooling supports regression (`max(sigmoid(parts))`) and classification (`1 − p(no_contact)`).
+- Training supports BCE with optional `pos_weight`, and CE fallback.
+- Validation logs per‑class accuracy, macro‑F1, and confusion matrix.
+- Documentation cross‑links updated; this file is the single source.
 
-### Phase 3 – Model: pooling rule
-- [x] Add `contact_regression` parameter to `FunctionalGraspModel.__init__()` and store as instance attribute for checkpoint compatibility.
-- [x] In `forward_backbone()`, branch pooling logic based on `self.contact_regression`:
-  - If True: `w = torch.max(torch.sigmoid(logits_c[..., :6]), dim=-1)[0]` (max part probability)
-  - If False: `w = 1 - softmax(logits_c)[..., 6]` (existing: 1 - p(no_contact))
-- [x] Store `inference_threshold` as model attribute from config, used later in validation.
+Defaults we will use now:
+- Contact threshold: **10 mm** (0.01 m)
+- Regression label mapping: Gaussian by default; logistic available
+- Inference threshold θ: default 0.4 (tunable)
 
-### Phase 4 – Training loss + metrics
-- [ ] Load cached class frequencies from Phase 2, compute `pos_weight = 1/sqrt(freq)` per class. (Deferred: will compute after testing)
-- [x] In `train_one_epoch()`, branch loss computation:
-  - BCE: `F.binary_cross_entropy_with_logits(logits_c, contact_targets, pos_weight=pos_weight)`
-  - CE: `F.cross_entropy(logits_c.view(B*N, 7), contact_labels.view(B*N))` (existing)
-- [x] Add `compute_contact_predictions()` helper:
-  - Regression: `probs = sigmoid(logits[..., :6])`, predict class 6 if `max(probs) ≤ θ`, else `argmax(probs)`
-  - CE: `argmax(logits)` (existing)
-- [x] Add `compute_contact_metrics()` returning:
-  - Per‑class accuracy: `[acc_0, ..., acc_6]`
-  - Macro‑F1: average of per‑class F1 scores
-  - Confusion matrix: 7×7 numpy array
-- [x] In `validate()`, compute and log these metrics to both `run.log` and TensorBoard.
-- [ ] Qualitative visualization in `validate()`: (Deferred to separate implementation)
-  - Select first `cfg['eval']['num_qualitative']` samples from batch
-  - For predictions: use `compute_contact_predictions()` + `model.sample()` for pose
-  - For GT: use `batch['contact_labels']`, `batch['pose'].view(-1,21,3)`, `batch['meta'][i]['hand_vertices']`
-  - Save figures to `cfg['paths']['qual_dir']` with descriptive names
-  - Log file paths in logger with format: `Saved qualitative: {path}`
-- [ ] Update `visualize_training.py` to parse and plot macro‑F1 and per‑class accuracy from `run.log`. (Deferred)
+### B. What is READY now
 
-### Phase 5 – Contact‑aware sampling
-- [ ] In `OakInkDataset._load_object_points()`, add contact‑aware sampling when `cfg['data']['contact_aware_sampling']` is True:
-  - Compute distances from all mesh points to nearest MANO vertex using vectorized `scipy.spatial.distance.cdist`
-  - Select points within `2 * contact_threshold` as "near" pool
-  - Sample `n_points * contact_aware_ratio` from near pool, remainder from far pool
-  - If near pool is too small, sample with replacement or fall back to uniform
-- [ ] Update config to expose sampling parameters:
-  - `DATA.contact_aware_sampling: bool` (default: False for initial testing)
-  - `DATA.contact_aware_ratio: float` (default: 0.5)
-  - `DATA.contact_aware_radius_factor: float` (default: 2.0)
+- `config.py` flags: `MODEL.contact_regression`, `MODEL.inference_threshold`, `TRAINING.contact_loss_type`, `TRAINING.pos_weight` (config key only), `REGRESSION_HPARAMS`, `EVAL.num_qualitative`, `EVAL.save_gt_qualitative`.
+- Dataset (`dataset/oakink_loader.py`):
+  - `_compute_soft_contact_targets()` (vectorized per‑part distances; Gaussian/Logistic; clamp radius)
+  - Returns `contact_labels` and `contact_targets`; adds `hand_vertices` to `batch['meta']`.
+- Model (`models/functional_grasp_model.py`):
+  - `contact_regression` + `inference_threshold` constructor args; branching pooling.
+- Training (`train.py`):
+  - BCE path with optional `pos_weight`; CE fallback
+  - `compute_contact_predictions()` and `compute_contact_metrics()`
+  - Validation logs overall acc, per‑class acc, macro‑F1, confusion matrix
 
-<!-- Removed legacy duplicate phases from earlier draft -->
+### C. Implementation status
 
-### Phase 6 – Sanity examples
-- [ ] Include sample run.log excerpts before/after changes and a small confusion matrix snippet in `pipeline.md`.
-- [ ] Provide a one‑liner to regenerate plots: `python visualize_training.py` → `outputs/training_metrics.png`.
+**✅ COMPLETED:**
+1) ✅ **Contact threshold standardized to 10mm**
+   - Updated `config.py`: `'contact_threshold': 0.01`
+   - Updated `REGRESSION_HPARAMS.tau_mm: 10.0`
+   - Updated documentation
 
-<!-- Ablation and tuning removed: document focuses on implementation steps only -->
+2) ✅ **Class frequency computation script**
+   - Created `compute_class_frequencies.py` (root level)
+   - Computes `pos_weight = 1 / sqrt(freq)` per class
+   - Saves to `/mnt/data/OakInk/cache/class_frequencies_train.json`
+   - Successfully tested and ready to use
 
-## Recommended defaults (initial)
-- **Metrics**: enable per‑class/macro metrics in validation.
-- **Loss**: BCE‑with‑logits with class‑wise `pos_weight` (sqrt‑inverse frequency); \(\lambda_{contact}=1.5\), \(\lambda_{flow}=1.0\) for first ~1–2 epochs.
-- **Pooling**: use `max(sigmoid(parts))` as contactness when `contact_regression=True`.
-- **Sampling**: Initially keep uniform (contact_aware_sampling=False); enable 50/50 mix after verifying soft targets work.
-- **Labels/targets**: threshold 8 mm; Gaussian soft targets with \(\tau=8\,\text{mm}\); clamp beyond 3× threshold.
-- **Qualitative**: `eval.num_qualitative=3`; save to `./outputs/qualitative` with both `_pred.png` and `_gt.png` per example.
+3) ✅ **Soft‑target caching**
+   - Added cache logic in `dataset/oakink_loader.py __getitem__()`
+   - Cache key: `f"{frame_id}_soft_{label_type}_{tau_mm}_{threshold_mm}_{clamp_factor}.pkl"`
+   - Cache location: `self.cache_dir / 'soft_targets' / cache_key`
+   - Loads from cache if exists, else computes and saves
 
-## Regression defaults
-- **Targets**: Gaussian \(\tau = 8\,\text{mm}\) or logistic \(t = 8\,\text{mm}, s = 3\,\text{mm}\).
-- **Inference**: threshold \(\theta\) configurable (default 0.4).
-- **Loss**: BCE‑with‑logits with class‑wise `pos_weight` (sqrt‑inverse frequency).
-- **Pooling**: use max part probability as contactness for conditioning.
+4) ✅ **Qualitative visualization**
+   - Implemented `generate_qualitative_visualizations()` in `train.py`
+   - Called from `validate()` after metrics
+   - Generates pred/GT figure pairs for first N samples
+   - Uses `utils/visualization_3d.create_hand_object_figure()`
+   - Saves to `cfg['paths']['qual_dir']`
+
+5) ✅ **Updated `visualize_training.py`**
+   - Parses enhanced metrics: macro-F1, per-class accuracy
+   - Plots 6 subplots (3×2) when enhanced metrics available
+   - Shows per-class accuracy trends with color-coded curves
+   - Shows macro-F1 dedicated plot and overlaid on accuracy
+
+**⏸️ OPTIONAL (deferred):**
+6) ⏸️ **Contact‑aware sampling**
+   - Config flags added but not implemented
+   - Can add later if needed for further improvements
+
+### D. Next steps (with data at /mnt/data)
+
+**Step 1: Compute class frequencies** (required for pos_weight)
+
+⚠️ **Important**: This is NOT part of data preparation. Run this ONCE before training.
+
+```bash
+# Option A: Run setup script (recommended)
+bash scripts/setup_training.sh
+
+# Option B: Run directly
+python compute_class_frequencies.py --data_path /mnt/data/OakInk --render_dir /mnt/data/OakInk/rendered_objects
+```
+
+What it does:
+- Loads the already-prepared training dataset
+- Iterates through all samples to count contact labels
+- Computes `pos_weight = 1/sqrt(freq)` per class (normalized)
+- Saves to `/mnt/data/OakInk/cache/class_frequencies_train.json`
+- Prints pos_weight values for inspection
+
+**Step 2: Train** (pos_weight auto-loads from cache)
+
+```bash
+# Quick test (1 epoch)
+python train.py --data_path /mnt/data/OakInk --epochs 1 --batch_size 2 --log_interval 5
+
+# Full training with train.sh
+bash scripts/train.sh
+
+# Or customize directly
+python train.py --data_path /mnt/data/OakInk --epochs 10 --batch_size 4
+```
+
+During training, verify:
+- Dataset loads correctly
+- Soft targets computed/cached (faster on subsequent epochs)
+- BCE loss decreases
+- Validation shows enhanced metrics (per-class acc, macro-F1, confusion matrix)
+- Qualitative visualizations saved to `outputs/qualitative/`
+
+**Step 3: Visualize results**
+```bash
+python visualize_training.py
+# Generates: outputs/training_metrics.png with 6 subplots including macro-F1 and per-class accuracy
+```
+
+### E. Expected outputs
+
+After running the steps above, you should have:
+
+1. **Class frequencies JSON**:
+   - `/mnt/data/OakInk/cache/class_frequencies_train.json`
+   - Contains counts, frequencies, and computed pos_weight per class
+
+2. **Soft target caches**:
+   - `/mnt/data/OakInk/cache/<split_mode>/<split>/soft_targets/*.pkl`
+   - One file per frame with soft regression targets
+   - Significantly speeds up training after first epoch
+
+3. **Training logs**:
+   - `logs/run.log` with enhanced metrics (per-class acc, macro-F1, confusion matrix)
+   - TensorBoard logs under `logs/`
+
+4. **Qualitative visualizations**:
+   - `outputs/qualitative/val_step_*_sample_*_pred.png` (predicted contact + pose)
+   - `outputs/qualitative/val_step_*_sample_*_gt.png` (ground truth contact + pose)
+
+5. **Training plots**:
+   - `outputs/training_metrics.png` with 6 subplots showing all metrics
+
+### F. Comparison: BCE vs CE modes
+
+To compare regression (BCE) vs classification (CE):
+
+```bash
+# Regression mode (default)
+python train.py --data_path /mnt/data/OakInk --epochs 5 --batch_size 4 --contact_regression
+
+# Classification mode (fallback)
+python train.py --data_path /mnt/data/OakInk --epochs 5 --batch_size 4 --no_contact_regression --contact_loss_type ce
+```
+
+Compare:
+- Overall accuracy (should be similar or CE slightly higher)
+- Macro-F1 (expect BCE >> CE due to better minority class handling)
+- Per-class accuracy (expect BCE better for fingers/palm, CE better for no_contact)
+- Confusion matrix (check finger misclassifications)
+
+---
+
+## Implementation details (for reference)
+
+### Key configuration defaults
+
+**Contact labeling:**
+- Threshold: 10mm (0.01m) standardized
+- Gaussian soft targets: τ = 10mm
+- Logistic soft targets: t = 10mm, s = 3mm
+- Clamp radius: 3× threshold (30mm)
+
+**Training:**
+- Loss: BCE with pos_weight (sqrt-inverse frequency)
+- λ_contact = 1.5, λ_flow = 1.0
+- Inference threshold θ = 0.4
+
+**Evaluation:**
+- Enhanced metrics: per-class accuracy, macro-F1, confusion matrix
+- Qualitative samples: 3 per validation
+- Save both pred and GT visualizations
+
+**Sampling:**
+- Default: uniform FPS (contact_aware_sampling=False)
+- Optional: 50/50 near/far mix when enabled
 
 

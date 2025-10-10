@@ -436,7 +436,7 @@ Contact labels are computed from MANO hand mesh topology and point-to-mesh dista
 - 6: No contact
 
 **Configuration**:
-- `contact_threshold`: Distance threshold in meters (default: 0.008 = 8mm)
+- `contact_threshold`: Distance threshold in meters (default: 0.01 = 10mm)
 
 ### Soft Target Computation (`_compute_soft_contact_targets`)
 

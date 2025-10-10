@@ -222,15 +222,46 @@ class OakInkDataset(Dataset):
         # Compute soft contact targets if enabled
         contact_targets = None
         if self.use_soft_targets:
-            contact_targets = self._compute_soft_contact_targets(
-                hand_vertices, 
-                points,
-                label_type=self.regression_hparams['label_type'],
-                tau_mm=self.regression_hparams['tau_mm'],
-                t_mm=self.regression_hparams['t_mm'],
-                s_mm=self.regression_hparams['s_mm'],
-                clamp_radius_factor=self.regression_hparams['clamp_radius_factor']
+            # Try to load from cache first
+            cache_subdir = self.cache_dir / 'soft_targets'
+            cache_key = (
+                f"{frame_id}_soft_"
+                f"{self.regression_hparams['label_type']}_"
+                f"{self.regression_hparams['tau_mm']:.1f}_"
+                f"{self.contact_threshold*1000:.1f}_"
+                f"{self.regression_hparams['clamp_radius_factor']:.1f}.pkl"
             )
+            cache_file = cache_subdir / cache_key
+            
+            if self.use_cache and cache_file.exists():
+                try:
+                    with open(cache_file, 'rb') as f:
+                        contact_targets = pickle.load(f)
+                except Exception as e:
+                    # Cache read failed, recompute
+                    contact_targets = None
+            
+            if contact_targets is None:
+                # Compute soft targets
+                contact_targets = self._compute_soft_contact_targets(
+                    hand_vertices, 
+                    points,
+                    label_type=self.regression_hparams['label_type'],
+                    tau_mm=self.regression_hparams['tau_mm'],
+                    t_mm=self.regression_hparams['t_mm'],
+                    s_mm=self.regression_hparams['s_mm'],
+                    clamp_radius_factor=self.regression_hparams['clamp_radius_factor']
+                )
+                
+                # Save to cache
+                if self.use_cache:
+                    try:
+                        cache_subdir.mkdir(parents=True, exist_ok=True)
+                        with open(cache_file, 'wb') as f:
+                            pickle.dump(contact_targets, f)
+                    except Exception as e:
+                        # Cache write failed, continue without caching
+                        pass
         
         # Generate semantic prompt
         text = self._generate_prompt(obj_id, seq_id)
