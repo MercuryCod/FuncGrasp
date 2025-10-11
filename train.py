@@ -20,6 +20,10 @@ from dataset.oakink_loader import create_oakink_loaders
 
 import numpy as np
 from sklearn.metrics import f1_score, confusion_matrix
+from pathlib import Path
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
 
 
 def compute_contact_predictions(logits_c, contact_regression=True, inference_threshold=0.4):
@@ -289,6 +293,107 @@ def train_one_epoch(model, loader, optimizer, cfg, device, writer, global_step):
     return global_step
 
 
+def generate_qualitative_visualizations(model, loader, cfg, device, global_step, logger):
+    """
+    Generate qualitative visualizations comparing predicted and ground-truth contact maps.
+    
+    Args:
+        model: Trained model
+        loader: Validation dataloader
+        cfg: Config dict
+        device: Device
+        global_step: Current training step
+        logger: Logger
+    """
+    from utils.visualization_3d import create_hand_object_figure
+    
+    model.eval()
+    qual_dir = Path(cfg['paths']['qual_dir'])
+    qual_dir.mkdir(parents=True, exist_ok=True)
+    
+    num_to_generate = min(cfg['eval']['num_qualitative'], len(loader.dataset))
+    
+    with torch.no_grad():
+        # Get first batch
+        batch = next(iter(loader))
+        
+        # Move to device
+        pts = batch["points"].to(device)
+        contact_labels = batch["contact_labels"]  # Keep on CPU for visualization
+        
+        # Forward pass
+        out = model.forward_train(
+            images_list=batch["images_list"],
+            texts_list=batch["texts_list"],
+            pts=pts
+        )
+        
+        logits_c = out["logits_c"]  # [B, N, 7]
+        
+        # Get predictions
+        pred_contacts = compute_contact_predictions(
+            logits_c,
+            contact_regression=cfg['model']['contact_regression'],
+            inference_threshold=cfg['model']['inference_threshold']
+        )  # [B, N]
+        
+        # Generate poses
+        pred_poses = model.sample(
+            batch["images_list"],
+            batch["texts_list"],
+            pts,
+            num_steps=20,
+            device=device
+        )  # [B, 63]
+        
+        # Generate visualizations
+        for i in range(min(num_to_generate, len(batch['points']))):
+            # Get data for this sample
+            points_i = batch['points'][i].cpu().numpy()  # [N, 3]
+            pred_labels_i = pred_contacts[i].cpu().numpy()  # [N]
+            gt_labels_i = contact_labels[i].cpu().numpy()  # [N]
+            pred_pose_i = pred_poses[i].cpu().numpy().reshape(21, 3)  # [21, 3]
+            gt_pose_i = batch['pose'][i].cpu().numpy().reshape(21, 3)  # [21, 3]
+            
+            # Get hand vertices if available
+            hand_vertices_i = None
+            if 'meta' in batch and i < len(batch['meta']):
+                hand_vertices_i = batch['meta'][i].get('hand_vertices', None)
+            
+            # Generate prediction figure
+            fig_pred = create_hand_object_figure(
+                points_i,
+                pred_labels_i,
+                hand_vertices=None,  # Don't show GT vertices with prediction
+                hand_joints=pred_pose_i,
+                show_joints=True,
+                figsize=(15, 5)
+            )
+            fig_pred.suptitle(f'Predicted Contact Map & Pose (Step {global_step}, Sample {i})', fontsize=14)
+            pred_path = qual_dir / f'val_step_{global_step}_sample_{i}_pred.png'
+            fig_pred.savefig(pred_path, dpi=100, bbox_inches='tight')
+            plt.close(fig_pred)
+            
+            # Generate ground truth figure if enabled
+            if cfg['eval']['save_gt_qualitative']:
+                fig_gt = create_hand_object_figure(
+                    points_i,
+                    gt_labels_i,
+                    hand_vertices=hand_vertices_i,
+                    hand_joints=gt_pose_i,
+                    show_joints=True,
+                    figsize=(15, 5)
+                )
+                fig_gt.suptitle(f'Ground Truth Contact Map & Pose (Step {global_step}, Sample {i})', fontsize=14)
+                gt_path = qual_dir / f'val_step_{global_step}_sample_{i}_gt.png'
+                fig_gt.savefig(gt_path, dpi=100, bbox_inches='tight')
+                plt.close(fig_gt)
+                
+                logger.info(f"Saved qualitative visualization pair: {pred_path.name}, {gt_path.name}")
+            else:
+                logger.info(f"Saved qualitative visualization: {pred_path.name}")
+
+
 def validate(model, loader, cfg, device, writer, global_step):
     """
     Validate the model with enhanced metrics.
@@ -411,6 +516,12 @@ def validate(model, loader, cfg, device, writer, global_step):
         # Log per-class accuracy
         for i, acc in enumerate(metrics['val_per_class_acc']):
             writer.add_scalar(f'Validation/per_class_acc_{Config.CONTACT_CLASSES[i]}', acc, global_step)
+    
+    # Generate qualitative visualizations if enabled
+    if cfg['eval']['num_qualitative'] > 0:
+        generate_qualitative_visualizations(
+            model, loader, cfg, device, global_step, logger
+        )
     
     return metrics
 
@@ -576,6 +687,18 @@ def main():
     # Device
     device = torch.device(cfg['device'])
     logger.info("Using device: %s", device)
+    
+    # Load class frequencies if available
+    freq_file = Path(cfg['data']['root_dir']) / 'cache' / 'class_frequencies_train.json'
+    if freq_file.exists() and cfg['training']['pos_weight'] is None:
+        import json
+        try:
+            with open(freq_file, 'r') as f:
+                freq_data = json.load(f)
+            cfg['training']['pos_weight'] = freq_data['pos_weight']
+            logger.info(f"Loaded pos_weight from cache: {cfg['training']['pos_weight']}")
+        except Exception as e:
+            logger.warning(f"Failed to load pos_weight from {freq_file}: {e}")
     
     # Data loaders
     logger.info("Loading data...")

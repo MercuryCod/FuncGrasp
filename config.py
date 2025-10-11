@@ -63,7 +63,7 @@ class Config:
         'root_dir': os.environ.get('OAKINK_PATH', '/DATA/disk0/OakInk'),
         'render_dir': os.environ.get('OAKINK_RENDER_DIR', '/DATA/disk0/OakInk/rendered_objects'),
         'split_mode': 'split0',  # Object-based split
-        'contact_threshold': 0.008,  # 8mm for contact approximation (reduced from 10mm)
+        'contact_threshold': 0.01,  # 10mm for contact approximation (standardized)
         'use_cache': True,
         'single_view': True,  # Use single view for efficiency
         'mano_model_path': os.environ.get('MANO_MODEL_PATH', 'assets/mano_v1_2/models/MANO_RIGHT.pkl'),
@@ -97,8 +97,8 @@ class Config:
     # Regression hyperparameters for soft contact targets
     REGRESSION_HPARAMS = {
         'label_type': 'gaussian',  # 'gaussian' or 'logistic'
-        'tau_mm': 8.0,  # Gaussian: decay parameter in mm
-        't_mm': 8.0,    # Logistic: threshold in mm
+        'tau_mm': 10.0,  # Gaussian: decay parameter in mm
+        't_mm': 10.0,    # Logistic: threshold in mm
         's_mm': 3.0,    # Logistic: scale parameter in mm
         'clamp_radius_factor': 3.0,  # Clamp soft targets to 0 beyond this factor * contact_threshold
     }

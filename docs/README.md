@@ -21,22 +21,17 @@ This directory contains the technical documentation for the FuncGrasp project.
 
 3. **[CONTACT_ACCURACY_IMPROVEMENT.md](CONTACT_ACCURACY_IMPROVEMENT.md)** - Contact Accuracy Enhancement Plan
    - Problem analysis and root causes
-   - Class-based regression approach
-   - Implementation plan (Phases 0-6)
+   - Class-based regression approach (BCE vs CE)
+   - Implementation status and next steps
    - Configuration and hyperparameters
 
+4. **[WORKFLOW.md](WORKFLOW.md)** - Training Workflow Guide
+   - Complete workflow from data prep to training
+   - Script purposes and when to run them
+   - Troubleshooting guide
+   - Examples and customization
+
 ### Supporting Documents
-
-3. **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)** - Implementation Status
-   - What was implemented (Phases 1-4)
-   - Design decisions and trade-offs
-   - Deferred features
-   - Usage examples
-
-4. **[TESTING_CHECKLIST.md](TESTING_CHECKLIST.md)** - Testing Guide
-   - Testing tasks for each phase
-   - Verification steps
-   - Known issues
 
 4. **[../CLAUDE.md](../CLAUDE.md)** - AI Assistant Context
    - Project overview for AI assistants
