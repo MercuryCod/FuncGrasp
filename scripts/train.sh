@@ -13,7 +13,7 @@ set -e  # Exit on error
 EXP_NAME=lora
 
 # Set defaults for optional environment variables
-DEBUG=true
+DEBUG=false
 QWEN_TUNING=lora
 DATA_ROOT=${DATA_ROOT:-/workspace/data}
 
