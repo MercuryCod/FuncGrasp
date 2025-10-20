@@ -543,7 +543,7 @@ hand_faces = mano_layer.th_faces.numpy()
 **Location**: `/workspace/FuncGrasp/scripts/prerender_objects.py`
 
 **Features**:
-- ✅ Batch rendering of all 68 unique objects
+- ✅ Batch rendering of all 85 unique objects
 - ✅ 6 viewpoints per object (front, back, left, right, top, bottom)
 - ✅ Matplotlib-based orthographic rendering
 - ✅ Automatic mesh normalization and centering
@@ -552,8 +552,8 @@ hand_faces = mano_layer.th_faces.numpy()
 - ✅ Error handling and metadata tracking
 
 **Output**: `/workspace/data/OakInk/rendered_objects/`
-- 68 object directories
-- 408 PNG images (68 × 6 views)
+- 85 object directories
+- 510 PNG images (85 × 6 views)
 - ~20MB total disk space
 - ~77 seconds rendering time
 
@@ -578,7 +578,7 @@ hand_faces = mano_layer.th_faces.numpy()
 
 ### Pre-rendering System
 Implemented complete object rendering pipeline:
-- Pre-render all objects once (~77s for 68 objects)
+- Pre-render all objects once (~2 minutes for 85 objects)
 - Load images in ~1-2ms vs rendering on-the-fly (~1s per object)
 - 6 canonical viewpoints with orthographic projection
 - Automatic validation and error handling

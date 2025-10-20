@@ -1,7 +1,15 @@
 """
 Contact Head for per-point contact prediction.
-Predicts 7-class contact logits for each point in the point cloud
-(thumb, index, middle, ring, little, palm, no_contact).
+Predicts 7-class contact logits for each point in the point cloud.
+
+Canonical class order (must match Config.CONTACT_CLASSES):
+  0: no_contact
+  1: palm
+  2: thumb
+  3: index
+  4: middle
+  5: ring
+  6: pinky
 """
 
 import torch

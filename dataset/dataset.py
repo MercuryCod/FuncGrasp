@@ -96,6 +96,8 @@ class OakInkDataset(Dataset):
         load_object_images: Whether to load pre-rendered multi-view images (default: False)
         rendered_dir: Path to rendered images directory (default: {data_root}/rendered_objects)
         transform: Optional transform to apply to samples
+        filter_zero_contact: If True, remove samples with zero contact points (approach poses)
+            Filters out ~15% of samples that are pre-grasp/approach configurations
     """
     
     def __init__(
@@ -108,6 +110,8 @@ class OakInkDataset(Dataset):
         load_object_images: bool = False,
         rendered_dir: Optional[str] = None,
         transform=None,
+        filter_zero_contact: bool = False,
+        load_object_geometry: bool = True,  # New: skip point cloud loading if False
     ):
         super().__init__()
 
@@ -117,7 +121,9 @@ class OakInkDataset(Dataset):
         self.compute_contacts = compute_contacts
         self.contact_threshold = contact_threshold
         self.load_object_images = load_object_images
+        self.load_object_geometry = load_object_geometry
         self.transform = transform
+        self.filter_zero_contact = filter_zero_contact
 
         # Paths
         self.shape_root = self.data_root / "shape"
@@ -138,11 +144,15 @@ class OakInkDataset(Dataset):
         # Build index
         self._build_index()
         
+        # Note: zero-contact filtering (if enabled) happens lazily in __getitem__
+        if self.filter_zero_contact and self.compute_contacts:
+            logging.info("Zero-contact filtering enabled (lazy mode - filtered during data loading)")
+        
         # Validate rendered images if requested
         if self.load_object_images:
             self._validate_rendered_images()
 
-        logging.info(f"Loaded {len(self)} grasp samples from OakInk ({self.split})")
+        logging.info("Loaded %d grasp samples from OakInk (%s)", len(self), self.split)
 
     def _load_metadata(self):
         """Load object metadata."""
@@ -441,91 +451,128 @@ class OakInkDataset(Dataset):
                     sample['mano_pose'], sample['mano_shape'], sample['mano_trans']
                 )
         """
-        sample_info = self.samples[idx]
-
-        # Load hand parameters
-        with open(sample_info["hand_param_file"], "rb") as f:
-            hand_params = pickle.load(f)
-
-        # Extract MANO parameters
-        mano_pose = hand_params["pose"].astype(np.float32)
-        mano_shape = hand_params["shape"].astype(np.float32)
-        mano_trans_raw = hand_params["tsl"].astype(np.float32)
-
-        # Use raw translation from dataset (wrist position)
-        # Note: To get hand joints/vertices, use mano_utils.mano_forward() separately
-        mano_trans = mano_trans_raw
-
-        # Load object point cloud
-        obj_points = self._load_object_pointcloud(sample_info["shape_id"])
-
-        # Get intent name
-        intent_name = next(
-            (k for k, v in ALL_INTENTS.items() if v == sample_info["action_id"]), "use"
-        )
-
-        # Generate instruction
-        instruction = self._generate_instruction(
-            sample_info["category"], sample_info["action_id"]
-        )
-
-        sample = {
-            "instruction": instruction,
-            "mano_pose": torch.from_numpy(mano_pose),
-            "mano_shape": torch.from_numpy(mano_shape),
-            "mano_trans": torch.from_numpy(mano_trans),
-            "obj_points": torch.from_numpy(obj_points),
-            "category": sample_info["category"],
-            "shape_id": sample_info["shape_id"],
-            "subject_id": sample_info["subject_id"],
-            "action_id": sample_info["action_id"],
-            "intent": intent_name,
-        }
+        # Lazy filtering: skip zero-contact samples if filter enabled
+        max_attempts = 10  # Avoid infinite loops if many consecutive zero-contact samples
         
-        # Compute contact labels if requested
-        if self.compute_contacts:
-            try:
-                from utils.contact_utils import compute_contact_points
-                
-                contact_info = compute_contact_points(
-                    mano_pose,
-                    mano_shape,
-                    mano_trans,
-                    obj_points,
-                    contact_threshold=self.contact_threshold,
-                    use_vertices=True
-                )
-                
-                # Add full contact info to sample
-                sample["contact_labels"] = torch.from_numpy(contact_info['finger_labels'].astype(np.int64))
-                sample["contact_mask"] = torch.from_numpy(contact_info['contact_mask'])
-                sample["contact_distances"] = torch.from_numpy(contact_info['contact_distances'].astype(np.float32))
-                sample["per_finger_distances"] = torch.from_numpy(contact_info['per_finger_distances'].astype(np.float32))
-                
-            except Exception as e:
-                logging.warning(f"Contact computation failed for sample {idx}: {e}")
-                # Fallback: all points labeled as no_contact (0)
-                sample["contact_labels"] = torch.zeros(self.num_points, dtype=torch.int64)
-                sample["contact_mask"] = torch.zeros(self.num_points, dtype=torch.bool)
-                sample["contact_distances"] = torch.full((self.num_points,), float('inf'), dtype=torch.float32)
-                sample["per_finger_distances"] = torch.full((self.num_points, 6), float('inf'), dtype=torch.float32)
+        for attempt in range(max_attempts):
+            # Use modulo to wrap around if we go past the end
+            current_idx = (idx + attempt) % len(self.samples)
+            sample_info = self.samples[current_idx]
+
+            # Load hand parameters
+            with open(sample_info["hand_param_file"], "rb") as f:
+                hand_params = pickle.load(f)
+
+            # Extract MANO parameters
+            mano_pose = hand_params["pose"].astype(np.float32)
+            mano_shape = hand_params["shape"].astype(np.float32)
+            mano_trans_raw = hand_params["tsl"].astype(np.float32)
+
+            # Use raw translation from dataset (wrist position)
+            # Note: To get hand joints/vertices, use mano_utils.mano_forward() separately
+            mano_trans = mano_trans_raw
+
+            # Load object point cloud (skip if only need MANO params for stats computation)
+            if self.load_object_geometry:
+                obj_points = self._load_object_pointcloud(sample_info["shape_id"])
+            else:
+                # Dummy point cloud (not used, saves loading time)
+                obj_points = np.zeros((self.num_points, 3), dtype=np.float32)
+
+            # Get intent name
+            intent_name = next(
+                (k for k, v in ALL_INTENTS.items() if v == sample_info["action_id"]), "use"
+            )
+
+            # Generate instruction
+            instruction = self._generate_instruction(
+                sample_info["category"], sample_info["action_id"]
+            )
+
+            # Convert to tensors
+            mano_pose_tensor = torch.from_numpy(mano_pose)
+            mano_shape_tensor = torch.from_numpy(mano_shape)
+            mano_trans_tensor = torch.from_numpy(mano_trans)
+            
+            sample = {
+                "instruction": instruction,
+                "mano_pose": mano_pose_tensor,
+                "mano_shape": mano_shape_tensor,
+                "mano_trans": mano_trans_tensor,
+                "obj_points": torch.from_numpy(obj_points),
+                "category": sample_info["category"],
+                "shape_id": sample_info["shape_id"],
+                "subject_id": sample_info["subject_id"],
+                "action_id": sample_info["action_id"],
+                "intent": intent_name,
+            }
+            
+            # Compute contact labels if requested
+            if self.compute_contacts:
+                try:
+                    from utils.contact_utils import compute_contact_points
+                    
+                    contact_info = compute_contact_points(
+                        mano_pose,
+                        mano_shape,
+                        mano_trans,
+                        obj_points,
+                        contact_threshold=self.contact_threshold,
+                        use_vertices=True
+                    )
+                    
+                    # Add full contact info to sample
+                    sample["contact_labels"] = torch.from_numpy(contact_info['finger_labels'].astype(np.int64))
+                    sample["contact_mask"] = torch.from_numpy(contact_info['contact_mask'])
+                    sample["contact_distances"] = torch.from_numpy(contact_info['contact_distances'].astype(np.float32))
+                    sample["per_finger_distances"] = torch.from_numpy(contact_info['per_finger_distances'].astype(np.float32))
+                    
+                    # Lazy filtering: skip zero-contact samples
+                    if self.filter_zero_contact:
+                        if contact_info['contact_mask'].sum() == 0:
+                            # No contact - try next sample
+                            continue
+                    
+                except Exception as e:
+                    # Strict behavior: surface the error immediately to avoid silent corrupt supervision
+                    raise ValueError(
+                        f"Contact computation failed for sample index {current_idx} (shape_id={sample_info.get('shape_id', 'unknown')}). "
+                        f"Original error: {type(e).__name__}: {e}"
+                    )
+            
+            # Load pre-rendered object images if requested
+            if self.load_object_images:
+                try:
+                    sample["object_images"] = self._load_rendered_images(sample_info["shape_id"])
+                except FileNotFoundError as e:
+                    # Re-raise with context about the sample
+                    logging.error("Failed to load rendered images for sample %d (object: %s)", current_idx, sample_info['shape_id'])
+                    raise
+                except Exception as e:
+                    # Unexpected error - log and re-raise
+                    logging.error("Unexpected error loading images for sample %d (object: %s): %s", current_idx, sample_info['shape_id'], e)
+                    raise
+            
+            if self.transform:
+                sample = self.transform(sample)
+            
+            # Add concatenated MANO parameters (for collate function compatibility)
+            # Concatenate: pose (48) + shape (10) + trans (3) = 61
+            mano_params = torch.cat([
+                sample['mano_pose'],    # [48]
+                sample['mano_shape'],   # [10]
+                sample['mano_trans']    # [3]
+            ])  # [61]
+            
+            # NO NORMALIZATION: Keep original MANO parameter space for generalization
+            # This allows the model to work on any dataset without dataset-specific bias
+            sample['mano_params'] = mano_params
+            
+            # Successfully loaded sample - return it
+            return sample
         
-        # Load pre-rendered object images if requested
-        if self.load_object_images:
-            try:
-                sample["object_images"] = self._load_rendered_images(sample_info["shape_id"])
-            except FileNotFoundError as e:
-                # Re-raise with context about the sample
-                logging.error(f"Failed to load rendered images for sample {idx} (object: {sample_info['shape_id']})")
-                raise
-            except Exception as e:
-                # Unexpected error - log and re-raise
-                logging.error(f"Unexpected error loading images for sample {idx} (object: {sample_info['shape_id']}): {e}")
-                raise
-        
-        if self.transform:
-            sample = self.transform(sample)
-        
+        # If we exhausted max_attempts, return the last sample anyway
+        # (This should rarely happen given only ~4% are zero-contact)
         return sample
 
     def get_statistics(self) -> Dict:

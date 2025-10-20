@@ -11,35 +11,29 @@ This script trains a multi-modal grasp prediction model that:
 Usage:
     # Basic training with default config
     python train.py
-    
+
     # Custom experiment name
     EXP_NAME=exp1 python train.py
-    
+
     # Debug mode (frequent logging and checkpointing)
     DEBUG=true python train.py
-    
+
     # Custom Qwen tuning mode
-    QWEN_TUNING=frozen python train.py    # Freeze Qwen (fastest)
-    QWEN_TUNING=lora python train.py      # LoRA fine-tuning (balanced)
-    QWEN_TUNING=full python train.py      # Full fine-tuning (slowest)
+    QWEN_TUNING=lora python train.py      # LoRA fine-tuning (default, efficient)
+    QWEN_TUNING=full python train.py      # Full fine-tuning (more parameters)
 """
 import os
 import sys
 import random
+import logging
+from functools import partial
+
 import numpy as np
-
-# Suppress tokenizers parallelism warning (we use DataLoader workers)
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-import logging
-
-# Project imports
-from functools import partial
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from config import Config
 from dataset.dataset import OakInkDataset
@@ -47,7 +41,7 @@ from dataset.collate import collate_oakink_batch
 from models.functional_grasp_model import FunctionalGraspModel
 from losses import ContactLoss, FlowMatchingLoss, compute_total_loss
 from utils.training_utils import (
-    setup_logging, save_checkpoint, load_checkpoint,
+    setup_logging, save_checkpoint,
     compute_contact_metrics, visualize_predictions
 )
 
@@ -64,11 +58,12 @@ def train_epoch(
     config: dict,
     epoch: int,
     device: torch.device,
-    global_step: int
+    global_step: int,
+    best_val_total: float
 ) -> tuple:
     """
     Train for one epoch.
-    
+
     Args:
         model: FunctionalGraspModel instance
         dataloader: Training data loader
@@ -80,9 +75,9 @@ def train_epoch(
         epoch: Current epoch number
         device: torch device
         global_step: Current global step counter
-    
+
     Returns:
-        (epoch_metrics, updated_global_step)
+        (epoch_metrics, updated_global_step, updated_best_val_total)
     """
     model.train()
     epoch_metrics = {
@@ -91,12 +86,12 @@ def train_epoch(
         'flow_loss': 0,
         'contact_accuracy': 0
     }
-    
+
     # Get logging and checkpoint intervals from config
     log_interval = config['training'].get('log_interval', 20)
     checkpoint_interval = config['training'].get('checkpoint_interval', 500)
     total_batches = len(dataloader)
-    
+
     # Simple progress tracking without tqdm
     for batch_idx, batch in enumerate(dataloader):
         # Move data to device
@@ -106,10 +101,10 @@ def train_epoch(
         contact_hard_labels = batch['contact_hard_labels'].to(device)    # [B, N] for metrics
         images_list = batch['images_list']  # List of PIL images
         texts_list = batch['texts_list']    # List of strings
-        
+
         # Forward pass: contact prediction + semantic/geometric encoding
         outputs = model.forward_train(images_list, texts_list, pts)
-        
+
         # Sample flow matching pairs
         # Rectified flow: learn v(x_t, t, c) where x_t = (1-t)*x_0 + t*x_1
         B = pts.shape[0]
@@ -118,11 +113,11 @@ def train_epoch(
         x1 = mano_params  # Target pose (data distribution)
         x_t = (1 - t[:, None]) * x0 + t[:, None] * x1  # Linear interpolation
         target_velocity = x1 - x0  # Constant velocity along straight path
-        
+
         # Forward pass: flow matching network
         model_velocity = model.flow_step(x_t, t, outputs['cond'])
         outputs['model_velocity'] = model_velocity
-        
+
         # Compute losses (use soft targets for training)
         losses = compute_total_loss(
             outputs,
@@ -136,85 +131,109 @@ def train_epoch(
             lambda_contact=config['training']['lambda_contact'],
             lambda_flow=config['training']['lambda_flow']
         )
-        
+
         # Backward pass
         optimizer.zero_grad()
         losses['total'].backward()
-        
+
         # Gradient clipping to prevent exploding gradients
         if config['training']['gradient_clip'] > 0:
             nn.utils.clip_grad_norm_(
-                model.parameters(), 
+                model.parameters(),
                 config['training']['gradient_clip']
             )
-        
+
         optimizer.step()
-        
+
         # Compute metrics (use hard labels for interpretable metrics)
         with torch.no_grad():
-            metrics = compute_contact_metrics(outputs['logits_c'], contact_hard_labels)
-        
+            metrics = compute_contact_metrics(
+                outputs['logits_c'], 
+                contact_hard_labels,
+                tau=config['data']['soft_target_tau'],
+                contact_threshold=config['data']['contact_threshold']
+            )
+
         # Accumulate epoch metrics
         epoch_metrics['loss'] += losses['total'].item()
         epoch_metrics['contact_loss'] += losses['contact'].item()
         epoch_metrics['flow_loss'] += losses['flow'].item()
         epoch_metrics['contact_accuracy'] += metrics['contact_accuracy']
-        
+
         # Log metrics at intervals
         if (batch_idx + 1) % log_interval == 0 or batch_idx == 0:
             avg_loss = epoch_metrics['loss'] / (batch_idx + 1)
             avg_c_loss = epoch_metrics['contact_loss'] / (batch_idx + 1)
             avg_f_loss = epoch_metrics['flow_loss'] / (batch_idx + 1)
             avg_c_acc = epoch_metrics['contact_accuracy'] / (batch_idx + 1)
-            
+
             logging.info(
-                f"Epoch {epoch+1} [{batch_idx+1}/{total_batches}] "
-                f"Loss: {losses['total'].item():.4f} (avg: {avg_loss:.4f}) "
-                f"C_Loss: {losses['contact'].item():.4f} (avg: {avg_c_loss:.4f}) "
-                f"F_Loss: {losses['flow'].item():.4f} (avg: {avg_f_loss:.4f}) "
-                f"C_Acc: {metrics['contact_accuracy']:.3f} (avg: {avg_c_acc:.3f})"
+                "Epoch %d [%d/%d] Loss: %.4f (avg: %.4f) "
+                "C_Loss: %.4f (avg: %.4f) F_Loss: %.4f (avg: %.4f) "
+                "C_Acc: %.3f (avg: %.3f)",
+                epoch+1, batch_idx+1, total_batches,
+                losses['total'].item(), avg_loss,
+                losses['contact'].item(), avg_c_loss,
+                losses['flow'].item(), avg_f_loss,
+                metrics['contact_accuracy'], avg_c_acc
             )
-        
+
         # Validate at step intervals
         val_interval = config['eval']['val_interval']
         if global_step > 0 and global_step % val_interval == 0:
-            logging.info(f"\n{'='*80}")
-            logging.info(f"Validation at step {global_step}")
-            logging.info(f"{'='*80}")
+            logging.info("\n%s", "="*80)
+            logging.info("Validation at step %d", global_step)
+            logging.info("%s", "="*80)
             val_metrics = validate(
                 model, val_loader, contact_criterion,
                 config, device, epoch, global_step, test_loader
             )
-            logging.info(f"Val - Total: {val_metrics['total_loss']:.4f} "
-                        f"(C: {val_metrics['contact_loss']:.4f}, F: {val_metrics['flow_loss']:.4f}), "
-                        f"Acc: {val_metrics['contact_accuracy']:.3f}, "
-                        f"F1: {val_metrics['contact_f1']:.3f}")
             logging.info(
-                f"  Per-Class Acc: "
-                f"no_c={val_metrics['acc_no_contact']:.3f} "
-                f"palm={val_metrics['acc_palm']:.3f} "
-                f"thumb={val_metrics['acc_thumb']:.3f} "
-                f"index={val_metrics['acc_index']:.3f} "
-                f"mid={val_metrics['acc_middle']:.3f} "
-                f"ring={val_metrics['acc_ring']:.3f} "
-                f"pinky={val_metrics['acc_pinky']:.3f}"
+                "Val - Total: %.4f (C: %.4f, F: %.4f), Acc: %.3f, F1: %.3f",
+                val_metrics['total_loss'], val_metrics['contact_loss'],
+                val_metrics['flow_loss'], val_metrics['contact_accuracy'],
+                val_metrics['contact_f1']
             )
-            logging.info(f"{'='*80}\n")
-        
+            logging.info(
+                "  Per-Class Acc: no_c=%.3f palm=%.3f thumb=%.3f "
+                "index=%.3f mid=%.3f ring=%.3f pinky=%.3f",
+                val_metrics['acc_no_contact'], val_metrics['acc_palm'],
+                val_metrics['acc_thumb'], val_metrics['acc_index'],
+                val_metrics['acc_middle'], val_metrics['acc_ring'],
+                val_metrics['acc_pinky']
+            )
+
+            # Save best model based on total validation loss
+            if val_metrics['total_loss'] < best_val_total:
+                best_val_total = val_metrics['total_loss']
+                logging.info("  🎉 New best Total Loss: %.4f", best_val_total)
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, val_metrics,
+                    os.path.join(config['paths']['checkpoint_dir'], 'best.pth'),
+                    is_best=True
+                )
+
+            logging.info("%s\n", "="*80)
+
         # Save debug checkpoint at intervals (if debug mode)
         if config.get('debug_mode', False) and batch_idx > 0 and (batch_idx + 1) % checkpoint_interval == 0:
-            checkpoint_path = os.path.join(config['paths']['checkpoint_dir'], f'debug_step_{global_step}.pt')
-            save_checkpoint(model, optimizer, scheduler, epoch, global_step, checkpoint_path)
-            logging.info(f"Debug checkpoint saved at step {global_step}")
-        
+            checkpoint_path = os.path.join(config['paths']['checkpoint_dir'], f'debug_step_{global_step}.pth')
+            debug_metrics = {
+                'global_step': global_step,
+                'batch_idx': batch_idx,
+                'epoch': epoch
+            }
+            save_checkpoint(model, optimizer, scheduler, epoch, debug_metrics, checkpoint_path)
+            logging.info("Debug checkpoint saved at step %d", global_step)
+
 
         global_step += 1
-    
+
     # Average metrics over epoch
     for k in epoch_metrics:
         epoch_metrics[k] /= len(dataloader)
-    
-    return epoch_metrics, global_step
+
+    return epoch_metrics, global_step, best_val_total
 
 
 @torch.no_grad()
@@ -230,7 +249,7 @@ def validate(
 ) -> dict:
     """
     Validate model on validation set.
-    
+
     Args:
         model: FunctionalGraspModel instance
         dataloader: Validation data loader
@@ -239,7 +258,7 @@ def validate(
         device: torch device
         epoch: Current epoch number (for visualization naming)
         test_loader: Optional test data loader for qualitative visualization
-    
+
     Returns:
         Dict of validation metrics
     """
@@ -261,15 +280,15 @@ def validate(
         'acc_ring': 0,
         'acc_pinky': 0
     }
-    
+
     # Get flow criterion and loss weights from config
     flow_criterion = FlowMatchingLoss()
     lambda_contact = config['training']['lambda_contact']
     lambda_flow = config['training']['lambda_flow']
-    
+
     total_batches = len(dataloader)
     log_interval = max(1, total_batches // 10)  # Log 10 times during validation
-    
+
     for batch_idx, batch in enumerate(dataloader):
         # Move data to device
         pts = batch['pts'].to(device)
@@ -278,66 +297,49 @@ def validate(
         contact_hard_labels = batch['contact_hard_labels'].to(device)    # [B, N] for metrics
         images_list = batch['images_list']
         texts_list = batch['texts_list']
-        
+
         # Forward pass for contact prediction
         outputs = model.forward_train(images_list, texts_list, pts)
-        
+
         # Contact loss (use soft targets)
         contact_loss = contact_criterion(outputs['logits_c'], contact_soft_targets)
-        
-        # Flow matching loss computation 
+
+        # Flow matching loss computation
         B = pts.shape[0]
         t = torch.rand(B, device=device)  # Random timestep
         x0 = torch.randn_like(mano_params)  # Noise
         x1 = mano_params  # Target pose
         x_t = (1 - t[:, None]) * x0 + t[:, None] * x1
         target_velocity = x1 - x0
-        
+
         # Forward pass for flow matching
         model_velocity = model.flow_step(x_t, t, outputs['cond'])
         flow_loss = flow_criterion(model_velocity, target_velocity, t)
-        
+
         # Total loss (weighted combination)
         total_loss = lambda_contact * contact_loss + lambda_flow * flow_loss
-        
+
         # Contact metrics (use hard labels for interpretable accuracy)
-        metrics = compute_contact_metrics(outputs['logits_c'], contact_hard_labels)
-        
+        metrics = compute_contact_metrics(
+            outputs['logits_c'], 
+            contact_hard_labels,
+            tau=config['data']['soft_target_tau'],
+            contact_threshold=config['data']['contact_threshold']
+        )
+
         # Accumulate metrics
         val_metrics['contact_loss'] += contact_loss.item()
         val_metrics['flow_loss'] += flow_loss.item()
         val_metrics['total_loss'] += total_loss.item()
         for k, v in metrics.items():
             val_metrics[k] += v
-        
-        # Log validation progress at intervals
-        if (batch_idx + 1) % log_interval == 0 or batch_idx == 0:
-            # Compute running averages for per-class metrics
-            avg_metrics = {k: val_metrics[k] / (batch_idx + 1) for k in val_metrics}
-            
-            logging.info(
-                f"Validation [{batch_idx+1}/{total_batches}] "
-                f"Loss: {total_loss.item():.4f} (C: {contact_loss.item():.4f}, F: {flow_loss.item():.4f}) "
-                f"C_Acc: {metrics['contact_accuracy']:.3f} (avg: {avg_metrics['contact_accuracy']:.3f})"
-            )
-            logging.info(
-                f"  Per-Class Acc: "
-                f"no_c={avg_metrics['acc_no_contact']:.3f} "
-                f"palm={avg_metrics['acc_palm']:.3f} "
-                f"thumb={avg_metrics['acc_thumb']:.3f} "
-                f"index={avg_metrics['acc_index']:.3f} "
-                f"mid={avg_metrics['acc_middle']:.3f} "
-                f"ring={avg_metrics['acc_ring']:.3f} "
-                f"pinky={avg_metrics['acc_pinky']:.3f}"
-            )
-    
+
     # Average metrics over all batches
     for k in val_metrics:
         val_metrics[k] /= len(dataloader)
-    
+
     # Qualitative visualization on test set (random samples)
     if test_loader is not None:
-        import random
         # Prefer validation set for qualitative unless explicitly configured to use test
         qual_source = config['eval'].get('qual_source', 'val')  # 'val' or 'test'
         if qual_source == 'test':
@@ -346,48 +348,56 @@ def validate(
         else:
             logging.info("\n  Generating qualitative visualizations on validation set...")
             qual_loader = dataloader
-        
+
         # Randomly select samples from chosen set
         num_qual = config['eval']['num_qualitative']
         qual_dataset = qual_loader.dataset
         total_qual = len(qual_dataset)
-        
+
         # Random indices
         random_indices = random.sample(range(total_qual), min(num_qual, total_qual))
-        
+
         # Manually fetch samples (to avoid batch collation issues)
         test_samples = [qual_dataset[i] for i in random_indices]
-        
+
         # Collate into a batch
         collate_fn = qual_loader.collate_fn
         test_batch = collate_fn(test_samples)
-        
+
         # Move to device
         pts = test_batch['pts'].to(device)
         images_list = test_batch['images_list']
         texts_list = test_batch['texts_list']
-        
+
         # Forward pass for contact prediction
         outputs = model.forward_train(images_list, texts_list, pts)
-        
+
         # Generate predicted grasp poses using flow matching
         logging.info("  Sampling grasp poses using flow matching...")
         predicted_poses = model.sample(
-            images_list, texts_list, pts, 
-            num_steps=20  # Could be configurable
+            images_list, texts_list, pts,
+            num_steps=config['flow']['num_steps_inference']
         )  # [B, 61]
         outputs['predicted_poses'] = predicted_poses
-        
+
         # Visualize (uses hard_labels from batch for GT visualization)
         # Include global_step in directory name to differentiate step-based validations
         save_dir = os.path.join(config['paths']['qual_dir'], f'step_{global_step:06d}')
-        visualize_predictions(test_batch, outputs, save_dir, num_samples=num_qual)
-    
+        visualize_predictions(
+            test_batch,
+            outputs,
+            save_dir,
+            num_samples=num_qual,
+            tau=config['data']['soft_target_tau'],
+            contact_threshold=config['data']['contact_threshold']
+        )
+
     model.train()
     return val_metrics
 
 
 def set_seed(seed: int = 42):
+    """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -396,13 +406,16 @@ def set_seed(seed: int = 42):
 
 def main():
     """Main training loop"""
-    
+
     # =================================================================
     # Setup
     # =================================================================
     config = Config.get_config('train')
     Config.create_dirs()
-    
+
+    # Suppress tokenizers parallelism warning (we use DataLoader workers)
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
     # Reproducibility
     set_seed(42)
 
@@ -412,43 +425,43 @@ def main():
     print(f"\nLogs are being saved to:")
     print(f"  - Full path: {log_file}")
     print(f"  - Quick access: {run_log}")
-    print(f"\nMonitor training with: tail -f {run_log}\n")
-    
+    print(f"\nMonitor training with: tail -f {run_log}\n")  # noqa: W1309
+
     # Check debug mode
     debug_mode = config.get('debug_mode', False)
     if debug_mode:
-        logging.info("="*80)
+        logging.info("%s", "="*80)
         logging.info("DEBUG MODE ENABLED")
-        logging.info(f"Log interval: {config['training']['log_interval']} steps")
-        logging.info(f"Checkpoint interval: {config['training']['checkpoint_interval']} steps")
-        logging.info(f"Validation interval: {config['eval']['val_interval']} steps")
+        logging.info("Log interval: %d steps", config['training']['log_interval'])
+        logging.info("Checkpoint interval: %d steps", config['training']['checkpoint_interval'])
+        logging.info("Validation interval: %d steps", config['eval']['val_interval'])
         max_val = config['eval'].get('max_val_samples', None)
         if max_val:
-            logging.info(f"Validation samples: limited to {max_val} (for faster debugging)")
-        logging.info("="*80)
-    
-    logging.info("="*80)
+            logging.info("Validation samples: limited to %d (for faster debugging)", max_val)
+        logging.info("%s", "="*80)
+
+    logging.info("%s", "="*80)
     logging.info("FUNCTIONAL GRASP TRAINING")
-    logging.info("="*80)
-    logging.info(f"Experiment: {Config.EXP_NAME}")
-    logging.info(f"Device: {config['device']}")
-    logging.info(f"Debug mode: {config['debug_mode']}")
-    logging.info(f"Qwen tuning: {config['model']['qwen_tuning']}")
-    
+    logging.info("%s", "="*80)
+    logging.info("Experiment: %s", Config.EXP_NAME)
+    logging.info("Device: %s", config['device'])
+    logging.info("Debug mode: %s", config['debug_mode'])
+    logging.info("Qwen tuning: %s", config['model']['qwen_tuning'])
+
     # Device setup
     device = torch.device(config['device'])
-    logging.info(f"Using device: {device}")
+    logging.info("Using device: %s", device)
     if device.type == 'cuda':
-        logging.info(f"GPU: {torch.cuda.get_device_name(0)}")
-        logging.info(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    
+        logging.info("GPU: %s", torch.cuda.get_device_name(0))
+        logging.info("GPU memory: %.2f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
+
     # =================================================================
     # Data Loading
     # =================================================================
-    logging.info("\n" + "="*80)
+    logging.info("\n%s", "="*80)
     logging.info("LOADING DATASETS")
-    logging.info("="*80)
-    
+    logging.info("%s", "="*80)
+
     # Training dataset
     logging.info("Creating training dataset...")
     train_dataset = OakInkDataset(
@@ -458,10 +471,11 @@ def main():
         compute_contacts=True,
         contact_threshold=config['data']['contact_threshold'],
         load_object_images=True,
-        rendered_dir=config['data']['render_dir']
+        rendered_dir=config['data']['render_dir'],
+        filter_zero_contact=config['data'].get('filter_zero_contact', False)
     )
-    logging.info(f"Train samples: {len(train_dataset)}")
-    
+    logging.info("Train samples: %d", len(train_dataset))
+
     # Validation dataset
     logging.info("Creating validation dataset...")
     val_dataset_full = OakInkDataset(
@@ -471,22 +485,24 @@ def main():
         compute_contacts=True,
         contact_threshold=config['data']['contact_threshold'],
         load_object_images=True,
-        rendered_dir=config['data']['render_dir']
+        rendered_dir=config['data']['render_dir'],
+        # Evaluation should include zero-contact approach poses for fair metrics
+        filter_zero_contact=False
     )
-    
+
     # Limit validation samples in debug mode for faster validation
     max_val_samples = config['eval'].get('max_val_samples', None)
     if max_val_samples is not None and len(val_dataset_full) > max_val_samples:
         from torch.utils.data import Subset
-        import random
         random.seed(42)  # Reproducible subset
         indices = random.sample(range(len(val_dataset_full)), max_val_samples)
         val_dataset = Subset(val_dataset_full, indices)
-        logging.info(f"Val samples: {len(val_dataset)} (subset of {len(val_dataset_full)} for debug mode)")
+        logging.info("Val samples: %d (subset of %d for debug mode)",
+                     len(val_dataset), len(val_dataset_full))
     else:
         val_dataset = val_dataset_full
-        logging.info(f"Val samples: {len(val_dataset)}")
-    
+        logging.info("Val samples: %d", len(val_dataset))
+
     # Test dataset (for qualitative visualization)
     logging.info("Creating test dataset...")
     test_dataset = OakInkDataset(
@@ -496,13 +512,14 @@ def main():
         compute_contacts=True,
         contact_threshold=config['data']['contact_threshold'],
         load_object_images=True,
-        rendered_dir=config['data']['render_dir']
+        rendered_dir=config['data']['render_dir'],
+        filter_zero_contact=False  # Keep all test samples for comprehensive evaluation
     )
-    logging.info(f"Test samples: {len(test_dataset)}")
-    
+    logging.info("Test samples: %d", len(test_dataset))
+
     # Create collate function with tau from config
     collate_fn = partial(collate_oakink_batch, soft_target_tau=config['data']['soft_target_tau'])
-    
+
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
@@ -513,7 +530,7 @@ def main():
         pin_memory=True,
         drop_last=True  # Drop last incomplete batch
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=config['training']['batch_size'],
@@ -522,7 +539,7 @@ def main():
         collate_fn=collate_fn,
         pin_memory=True
     )
-    
+
     test_loader = DataLoader(
         test_dataset,
         batch_size=3,  # Exactly 3 samples for visualization
@@ -531,15 +548,19 @@ def main():
         collate_fn=collate_fn,
         pin_memory=False
     )
-    
-    logging.info(f"Train batches per epoch: {len(train_loader)}")
-    logging.info(f"Val batches: {len(val_loader)}")
-    logging.info(f"Test batches: {len(test_loader)}")
-    
+
+    logging.info("Train batches per epoch: %d", len(train_loader))
+    logging.info("Val batches: %d", len(val_loader))
+    logging.info("Test batches: %d", len(test_loader))
+
     # =================================================================
     # Model Creation
     # =================================================================
     
+    logging.info("\n%s", "="*80)
+    logging.info("CREATING MODEL")
+    logging.info("%s", "="*80)
+
     model = FunctionalGraspModel(
         CSEM=config['model']['CSEM'],
         CGEO=config['model']['CGEO'],
@@ -547,136 +568,116 @@ def main():
         K_CONTACT=config['model']['K_CONTACT'],
         qwen_tuning=config['model']['qwen_tuning'],
         lora_cfg=config['lora'],
-        contact_regression=config['model']['contact_regression'],
-        inference_threshold=config['model']['inference_threshold']
+        contact_regression=config['model']['contact_regression']
     ).to(device)
-    
+
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logging.info(f"Total parameters: {total_params:,}")
-    logging.info(f"Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
-    
+    logging.info("Total parameters: %s", f"{total_params:,}")
+    logging.info("Trainable parameters: %s (%.2f%%)",
+                 f"{trainable_params:,}", 100*trainable_params/total_params)
+
     # =================================================================
     # Optimization Setup
     # =================================================================
-    logging.info("\n" + "="*80)
+    logging.info("\n%s", "="*80)
     logging.info("OPTIMIZATION SETUP")
-    logging.info("="*80)
-    
+    logging.info("%s", "="*80)
+
     # Loss functions
-    contact_criterion = ContactLoss(no_contact_weight=0.1)
+    contact_criterion = ContactLoss(no_contact_weight=config['data']['no_contact_weight'])
     flow_criterion = FlowMatchingLoss()
-    logging.info(f"Contact loss: BCE with no_contact_weight=0.1")
-    logging.info(f"Flow loss: MSE for rectified flow")
-    logging.info(f"Loss weights: λ_contact={config['training']['lambda_contact']}, λ_flow={config['training']['lambda_flow']}")
-    
+    logging.info("Contact loss: BCE with no_contact_weight=%.2f", config['data']['no_contact_weight'])
+    logging.info("Flow loss: MSE for rectified flow")
+    logging.info("Loss weights: λ_contact=%.1f, λ_flow=%.1f",
+                 config['training']['lambda_contact'], config['training']['lambda_flow'])
+
     # Optimizer
     optimizer = AdamW(
         model.parameters(),
         lr=config['training']['learning_rate'],
         weight_decay=config['training']['weight_decay']
     )
-    logging.info(f"Optimizer: AdamW (lr={config['training']['learning_rate']}, wd={config['training']['weight_decay']})")
-    
-    # Learning rate scheduler
-    scheduler = CosineAnnealingLR(
+    logging.info("Optimizer: AdamW (lr=%.4f, wd=%.2f)",
+                 config['training']['learning_rate'], config['training']['weight_decay'])
+
+    # Learning rate scheduler with warmup
+    warmup_epochs = config['training'].get('warmup_epochs', 3)
+    warmup_scheduler = LinearLR(
         optimizer,
-        T_max=config['training']['epochs'],
+        start_factor=0.1,  # Start at 10% of base LR
+        end_factor=1.0,    # Reach 100% after warmup
+        total_iters=warmup_epochs
+    )
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=config['training']['epochs'] - warmup_epochs,
         eta_min=1e-6
     )
-    logging.info(f"Scheduler: CosineAnnealingLR (T_max={config['training']['epochs']}, eta_min=1e-6)")
-    
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs]
+    )
+    logging.info("Scheduler: Warmup (%d epochs) + CosineAnnealing (T_max=%d, eta_min=1e-6)",
+                 warmup_epochs, config['training']['epochs'] - warmup_epochs)
+
     # =================================================================
     # Training Loop
     # =================================================================
-    logging.info("\n" + "="*80)
+    logging.info("\n%s", "="*80)
     logging.info("STARTING TRAINING")
-    logging.info("="*80)
-    logging.info(f"Epochs: {config['training']['epochs']}")
-    logging.info(f"Batch size: {config['training']['batch_size']}")
-    logging.info(f"Gradient clip: {config['training']['gradient_clip']}")
-    
-    best_val_f1 = 0.0
+    logging.info("%s", "="*80)
+    logging.info("Epochs: %d", config['training']['epochs'])
+    logging.info("Batch size: %d", config['training']['batch_size'])
+    logging.info("Gradient clip: %.1f", config['training']['gradient_clip'])
+
+    best_val_total = float('inf')
     global_step = 0
-    
+
     for epoch in range(config['training']['epochs']):
-        logging.info(f"\n{'='*80}")
-        logging.info(f"Epoch {epoch+1}/{config['training']['epochs']}")
-        logging.info(f"{'='*80}")
-        
+        logging.info("\n%s", "="*80)
+        logging.info("Epoch %d/%d", epoch+1, config['training']['epochs'])
+        logging.info("%s", "="*80)
+
         # Train (includes step-based validation)
-        train_metrics, global_step = train_epoch(
+        train_metrics, global_step, best_val_total = train_epoch(
             model, train_loader, optimizer, scheduler,
             contact_criterion, flow_criterion,
             val_loader, test_loader,
-            config, epoch, device, global_step
+            config, epoch, device, global_step, best_val_total
         )
-        
-        # End-of-epoch validation
-        logging.info(f"\n{'='*80}")
-        logging.info(f"End-of-Epoch {epoch+1} Validation")
-        logging.info(f"{'='*80}")
-        val_metrics = validate(
-            model, val_loader, contact_criterion,
-            config, device, epoch, global_step, test_loader
-        )
-        
-        # Log metrics
-        logging.info(f"\nEpoch {epoch+1} Summary:")
-        logging.info(f"  Train - Loss: {train_metrics['loss']:.4f}, "
-                    f"Contact: {train_metrics['contact_loss']:.4f}, "
-                    f"Flow: {train_metrics['flow_loss']:.4f}, "
-                    f"Acc: {train_metrics['contact_accuracy']:.3f}")
-        logging.info(f"  Val   - Total: {val_metrics['total_loss']:.4f} "
-                    f"(C: {val_metrics['contact_loss']:.4f}, F: {val_metrics['flow_loss']:.4f}), "
-                    f"Acc: {val_metrics['contact_accuracy']:.3f}, "
-                    f"Prec: {val_metrics['contact_precision']:.3f}, "
-                    f"Rec: {val_metrics['contact_recall']:.3f}, "
-                    f"F1: {val_metrics['contact_f1']:.3f}")
-        
-        # Log per-class accuracies
-        logging.info(f"  Val Per-Class Accuracy:")
-        logging.info(f"    no_contact: {val_metrics['acc_no_contact']:.3f}, "
-                    f"palm: {val_metrics['acc_palm']:.3f}, "
-                    f"thumb: {val_metrics['acc_thumb']:.3f}")
-        logging.info(f"    index: {val_metrics['acc_index']:.3f}, "
-                    f"middle: {val_metrics['acc_middle']:.3f}, "
-                    f"ring: {val_metrics['acc_ring']:.3f}, "
-                    f"pinky: {val_metrics['acc_pinky']:.3f}")
 
-        
-        # Save best model based on F1 score
-        if val_metrics['contact_f1'] > best_val_f1:
-            best_val_f1 = val_metrics['contact_f1']
-            logging.info(f"  🎉 New best F1: {best_val_f1:.4f}")
-            save_checkpoint(
-                model, optimizer, scheduler, epoch, val_metrics,
-                os.path.join(config['paths']['checkpoint_dir'], f'epoch_{epoch+1:03d}.pth'),
-                is_best=True
-            )
-        
+        # Log epoch summary with current LR
+        current_lr = scheduler.get_last_lr()[0]
+        logging.info("\nEpoch %d Summary:", epoch+1)
+        logging.info("  Train - Loss: %.4f, Contact: %.4f, Flow: %.4f, Acc: %.3f",
+                    train_metrics['loss'], train_metrics['contact_loss'],
+                    train_metrics['flow_loss'], train_metrics['contact_accuracy'])
+        logging.info("  Learning rate: %.6f", current_lr)
+
         # Save periodic checkpoints
         if (epoch + 1) % config['training']['checkpoint_interval'] == 0:
             save_checkpoint(
                 model, optimizer, scheduler, epoch, train_metrics,
                 os.path.join(config['paths']['checkpoint_dir'], f'epoch_{epoch+1:03d}.pth')
             )
-        
-        # Step scheduler (cosine annealing)
+
+        # Step scheduler (warmup + cosine annealing)
         scheduler.step()
-    
+
     # =================================================================
     # Training Complete
     # =================================================================
-    logging.info("\n" + "="*80)
+    logging.info("\n%s", "="*80)
     logging.info("TRAINING COMPLETE")
-    logging.info("="*80)
-    logging.info(f"Best validation F1 score: {best_val_f1:.4f}")
-    logging.info(f"Checkpoints saved to: {config['paths']['checkpoint_dir']}")
-    logging.info(f"Training logs saved to: {log_file}")
-    logging.info(f"Quick access: {run_log}")
-    logging.info(f"Visualizations saved to: {config['paths']['qual_dir']}")
+    logging.info("%s", "="*80)
+    logging.info("Best validation Total Loss: %.4f", best_val_total)
+    logging.info("Checkpoints saved to: %s", config['paths']['checkpoint_dir'])
+    logging.info("Training logs saved to: %s", log_file)
+    logging.info("Quick access: %s", run_log)
+    logging.info("Visualizations saved to: %s", config['paths']['qual_dir'])
     logging.info("\n✅ Training finished successfully!")
 
 
@@ -687,7 +688,7 @@ if __name__ == '__main__':
         logging.info("\n\n⚠️  Training interrupted by user (Ctrl+C)")
         sys.exit(0)
     except Exception as e:
-        logging.error(f"\n\n❌ Training failed with error:")
-        logging.error(f"{type(e).__name__}: {e}", exc_info=True)
+        logging.error("\n\n❌ Training failed with error:")
+        logging.error("%s: %s", type(e).__name__, str(e), exc_info=True)
         sys.exit(1)
 

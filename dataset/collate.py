@@ -16,41 +16,93 @@ from typing import List, Dict
 def compute_soft_targets_from_per_finger_distances(
     per_finger_distances: np.ndarray,
     tau: float = 0.01,
-    min_prob: float = 1e-6
+    validate: bool = True
 ) -> np.ndarray:
     """
-    Convert per-finger distances to soft probability distributions.
+    Convert per-finger distances to independent soft targets using RBF kernel.
     
-    Creates independent probability for each hand part based on distance.
-    Closer distances → higher probabilities.
+    Formula: soft_target = exp(-distance / tau)
+    
+    This is the standard Radial Basis Function (Gaussian) kernel.
+    Each hand part has an INDEPENDENT probability - targets DO NOT sum to 1.0.
+    
+    CRITICAL: Probabilities are INDEPENDENT (not mutually exclusive):
+    - A point can have high probability for multiple parts (e.g., near boundaries)
+    - A point can have low probability for all parts (far from hand)
+    - This matches the Binary Cross-Entropy loss semantics
     
     Args:
-        per_finger_distances: [N, 6] distances in meters
+        per_finger_distances: [N, 6] distances in METERS
             Column 0: palm, 1: thumb, 2: index, 3: middle, 4: ring, 5: pinky
-        tau: Temperature (default 0.01 = 10mm). Smaller = sharper probabilities
-        min_prob: Minimum probability floor for numerical stability
+        tau: Length scale in METERS (default 0.01 = 10mm)
+            Interpretation: distance at which value drops to ~37% (1/e)
+        validate: If True, perform input validation (default: True)
     
     Returns:
-        soft_targets: [N, 6] probability distribution (each row sums to ~1)
+        soft_targets: [N, 6] independent probabilities in (0, 1]
+                      NOTE: Rows do NOT sum to 1.0 (this is intentional!)
     
     Example:
         distances = [[0.002, 0.005, 0.050, 0.080, 0.100, 0.120]]  # 1 point
                      # palm   thumb  index  middle ring   pinky
         
-        probs = exp(-distances / 0.01) = [0.819, 0.607, 0.007, 0.0003, ...]
-        normalized = [0.573, 0.425, 0.005, ...] # Sums to 1.0
+        soft_targets = exp(-distances / 0.01) = [0.819, 0.607, 0.007, 0.0003, ...]
+        # Sum = 1.433 (> 1.0 is valid for independent probabilities!)
         
-        Interpretation: Point is 57% likely palm contact, 42% likely thumb
+        Interpretation: 81.9% probability of palm contact (independent)
+                       60.7% probability of thumb contact (independent)
+                       These are NOT mutually exclusive events
+    
+    CONTACT CLASS INDEXING:
+    =======================
+    Dataset Labels (7 classes): [0, 1, 2, 3, 4, 5, 6]
+      0=no_contact, 1=palm, 2=thumb, 3=index, 4=middle, 5=ring, 6=pinky
+    
+    Model Logits (7 values): [0, 1, 2, 3, 4, 5, 6]
+      Index 0: no_contact (computed but UNUSED in loss)
+      Indices 1-6: contact parts (USED in loss)
+    
+    Soft Targets (6 values): [0, 1, 2, 3, 4, 5]
+      Maps to logits[1:6] (palm through pinky)
+    
+    Usage: loss = BCE(logits[:, :, 1:], soft_targets)
     """
-    # Gaussian kernel: P ∝ exp(-distance / tau)
-    unnormalized_probs = np.exp(-per_finger_distances / tau)  # [N, 6]
+    # ✓ Input validation
+    if validate:
+        if tau <= 0:
+            raise ValueError(
+                f"tau must be positive, got {tau}. "
+                f"Typical value: 0.01 (10mm)"
+            )
+        
+        if not np.all(np.isfinite(per_finger_distances)):
+            raise ValueError(
+                f"per_finger_distances contains non-finite values: "
+                f"min={per_finger_distances.min()}, max={per_finger_distances.max()}"
+            )
+        
+        if np.any(per_finger_distances < 0):
+            raise ValueError(
+                f"per_finger_distances contains negative values: "
+                f"min={per_finger_distances.min()}. Distances must be non-negative."
+            )
+        
+        # Warn about potential unit mismatch
+        if np.median(per_finger_distances) > 1.0:
+            import warnings
+            warnings.warn(
+                f"Median distance = {np.median(per_finger_distances):.3f} > 1.0. "
+                f"Distances should be in METERS, not millimeters. "
+                f"Did you forget to divide by 1000?",
+                RuntimeWarning
+            )
     
-    # Floor to prevent numerical issues
-    unnormalized_probs = np.maximum(unnormalized_probs, min_prob)
+    # RBF (Radial Basis Function) kernel: naturally bounded to (0, 1]
+    soft_targets = np.exp(-per_finger_distances / tau)  # [N, 6]
     
-    # Normalize so each point's probabilities sum to 1
-    row_sums = unnormalized_probs.sum(axis=1, keepdims=True)
-    soft_targets = unnormalized_probs / row_sums
+    # ✓ NO NORMALIZATION - keep as independent probabilities
+    # This is intentional! Probabilities do NOT sum to 1.0.
+    # They are independent probabilities for each hand part.
     
     return soft_targets.astype(np.float32)
 
@@ -100,18 +152,15 @@ def collate_oakink_batch(batch: List[Dict], soft_target_tau: float = 0.01) -> Di
             texts_list: List[str] text instructions
             metadata: Dict with categories, intents, shape_ids, subject_ids
     """
-    B = len(batch)
+    # B = len(batch)  # Unused, but documents batch size
     
     # Stack point clouds
     pts = torch.stack([s['obj_points'] for s in batch])  # [B, N, 3]
     
-    # Stack and concatenate MANO parameters
-    # Each sample has pose (48), shape (10), trans (3) → concatenate to 61-dim
-    mano_params = torch.cat([
-        torch.stack([s['mano_pose'] for s in batch]),     # [B, 48]
-        torch.stack([s['mano_shape'] for s in batch]),    # [B, 10]
-        torch.stack([s['mano_trans'] for s in batch])     # [B, 3]
-    ], dim=-1)  # [B, 61]
+    # Stack MANO parameters (pre-concatenated in dataset, NO normalization)
+    # Dataset provides 'mano_params' [61] = pose (48) + shape (10) + trans (3)
+    # Note: We intentionally avoid normalization to preserve cross-dataset generalization
+    mano_params = torch.stack([s['mano_params'] for s in batch])  # [B, 61]
     
     # Verify dimension
     assert mano_params.shape[1] == 61, \
@@ -139,18 +188,14 @@ def collate_oakink_batch(batch: List[Dict], soft_target_tau: float = 0.01) -> Di
     contact_hard_labels = torch.stack(hard_labels_list)    # [B, N] - integer labels for visualization
     
     # Convert images: torch.Tensor → PIL.Image
+    # Use all 6 views in consistent order: front, back, left, right, top, bottom
+    views = ['front', 'back', 'left', 'right', 'top', 'bottom']
     images_list = []
     for s in batch:
         if 'object_images' in s and s['object_images']:
-            # Single-view strategy: use front view only
-            # For multi-view, uncomment the alternative below
-            front_img = tensor_to_pil(s['object_images']['front'])
-            images_list.append([front_img])
-            
-            # Multi-view strategy (alternative):
-            # views = ['front', 'left', 'right', 'top']
-            # imgs = [tensor_to_pil(s['object_images'][v]) for v in views]
-            # images_list.append(imgs)
+            # Load all 6 views in order
+            imgs = [tensor_to_pil(s['object_images'][v]) for v in views]
+            images_list.append(imgs)
         else:
             # No images available - text-only mode
             images_list.append([])
@@ -186,13 +231,18 @@ def collate_oakink_batch_multiview(batch: List[Dict], views: List[str] = None) -
         views: List of view names to use (default: ['front', 'left', 'right', 'top'])
     
     Returns:
-        Same as collate_oakink_batch but with multiple images per sample
+        Same as collate_oakink_batch but with multiple images per sample.
+
+    Note:
+        - This helper is intended for feature extraction/visualization.
+        - It does NOT compute soft targets or keep hard labels for training.
+        - Do not use it as the training collate_fn unless extended accordingly.
     """
     if views is None:
         views = ['front', 'left', 'right', 'top']
     
     # Same as single-view, but load multiple views
-    B = len(batch)
+    # batch_size = len(batch)  # Unused
     
     pts = torch.stack([s['obj_points'] for s in batch])
     

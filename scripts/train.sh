@@ -4,16 +4,16 @@
 #
 # Environment variables (optional):
 #   DEBUG=true         Enable debug mode (default: false)
-#   QWEN_TUNING=lora   Qwen tuning mode: frozen/lora/full (default: lora)
+#   QWEN_TUNING=lora   Qwen tuning mode: lora/full (default: lora)
 #   DATA_ROOT=/path    Data root directory (default: /workspace/data)
 
 set -e  # Exit on error
 
 # Get experiment name from argument or environment
-EXP_NAME=lora
+EXP_NAME=lora_test
 
 # Set defaults for optional environment variables
-DEBUG=false
+DEBUG=true
 QWEN_TUNING=lora
 DATA_ROOT=${DATA_ROOT:-/workspace/data}
 

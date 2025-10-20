@@ -1,16 +1,19 @@
 # Documentation Index
 
+**Version**: 2.0
+**Last Updated**: October 2025
+
 Quick navigation for FuncGrasp documentation.
 
 ## Core Documents
 
 ### 📋 [README.md](README.md)
-**Purpose**: Quick start guide and navigation map  
+**Purpose**: Quick start guide and navigation map
 **Contains**:
+- v2.0 status and changes
 - Setup instructions
 - Basic usage examples
 - Quick statistics
-- Recent updates summary
 - Documentation guidelines
 
 ### 📊 [OAKINK_DATASET_DOCUMENTATION.md](OAKINK_DATASET_DOCUMENTATION.md)
@@ -35,10 +38,11 @@ Quick navigation for FuncGrasp documentation.
 - Troubleshooting
 
 ### 🚀 [PIPELINE_DESIGN.md](PIPELINE_DESIGN.md)
-**Purpose**: Complete architecture and training pipeline design  
+**Purpose**: Complete architecture and training pipeline design
 **Contains**:
+- **v2.0 Changes**: Critical fixes and improvements
 - Full architecture diagram (geometric + semantic encoders, fusion, contact, flow)
-- Distance-based soft contact targets (Gaussian kernel, per-finger probabilities)
+- Distance-based soft contact targets (RBF kernel, independent probabilities)
 - Contact loss design (multi-label BCE with contact-strength weighting)
 - Flow matching implementation (rectified flow, Euler integration)
 - Training loop details (forward pass, loss computation, backward pass)
@@ -58,24 +62,40 @@ Quick navigation for FuncGrasp documentation.
 - Integration with our functional grasp project
 - Troubleshooting guide
 
+### 📝 [CHANGELOG.md](../CHANGELOG.md)
+**Purpose**: Version history and migration guide
+**Contains**:
+- v2.0 critical fixes (soft targets, gradient flow, numerical stability)
+- Technical details of formula changes
+- Migration guide for existing code
+- Rollback commands if needed
+
 ---
 
 ## Document Relationships
 
 ```
 README.md (Map)
+├── v2.0 status and changes
 ├── Quick start and setup
 ├── Training quick start
 ├── Points to → PIPELINE_DESIGN.md (for architecture and training details)
 └── Points to → Other docs for specific topics
 
 PIPELINE_DESIGN.md (Architecture & Training)
+├── v2.0 changes and fixes
 ├── Full system architecture
-├── Contact prediction with soft targets
+├── Contact prediction with soft targets (RBF kernel)
 ├── Flow matching for pose generation
 ├── Training loop and losses
 ├── Debug features
 └── Points to → All component docs
+
+CHANGELOG.md (Version History)
+├── v2.0 critical fixes
+├── Technical details
+├── Migration guide
+└── Rollback commands
 
 OAKINK_DATASET_DOCUMENTATION.md (Dataset)
 ├── Dataset structure and conventions
@@ -143,6 +163,12 @@ QWEN25VL_DOCUMENTATION.md (VL Model)
 ### Troubleshooting
 - [MANO Issues](MANO_HAND_MODEL.md#troubleshooting)
 - [Contact Computation](MANO_HAND_MODEL.md#contact-computation)
+- [Common Pipeline Issues](PIPELINE_DESIGN.md#common-issues--solutions)
+
+### Version History
+- [v2.0 Changes](PIPELINE_DESIGN.md#version-20-changes)
+- [CHANGELOG](../CHANGELOG.md)
+- [Migration Guide](../CHANGELOG.md#migration-guide)
 
 ---
 
@@ -155,5 +181,5 @@ See [README.md - Documentation Guidelines](README.md#documentation-guidelines) f
 
 ---
 
-**Last Updated**: 2024-10-16
+**Last Updated**: October 2025
 

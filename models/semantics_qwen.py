@@ -1,4 +1,4 @@
-# semantics_qwen.py (corrected)
+# semantics_qwen.py
 import torch
 import torch.nn as nn
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
@@ -6,30 +6,27 @@ from qwen_vl_utils import process_vision_info
 
 
 class QwenSemanticsEncoder(nn.Module):
-    def __init__(self, dtype=torch.float16, tuning='frozen', lora_cfg=None):
+    def __init__(self, tuning='lora', lora_cfg=None):
         super().__init__()
         model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
 
         self.processor = AutoProcessor.from_pretrained(model_name)
         self.backbone = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_name, dtype=dtype, device_map=None
+            model_name, dtype=torch.bfloat16, device_map="auto"
         )
-        
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.backbone = self.backbone.to(device)
+
 
         self.tuning = tuning
-        if tuning == 'frozen':
-            for p in self.backbone.parameters():
-                p.requires_grad_(False)
-        elif tuning == 'lora':
+
+        if tuning == 'lora':
             for p in self.backbone.parameters():
                 p.requires_grad_(False)
             from peft import LoraConfig, get_peft_model
             lora_cfg = lora_cfg or {}
+            # Defaults match Config.LORA for consistency
             lora_config = LoraConfig(
-                r=lora_cfg.get('r', 16),
-                lora_alpha=lora_cfg.get('alpha', 32),
+                r=lora_cfg.get('r', 32),
+                lora_alpha=lora_cfg.get('alpha', 64),
                 lora_dropout=lora_cfg.get('dropout', 0.05),
                 target_modules=lora_cfg.get('target_modules', [
                     'q_proj', 'k_proj', 'v_proj', 'o_proj',
@@ -40,13 +37,14 @@ class QwenSemanticsEncoder(nn.Module):
             )
             self.backbone = get_peft_model(self.backbone, lora_config)
         elif tuning == 'full':
-            pass
+            # Full fine-tuning: all parameters trainable
+            for p in self.backbone.parameters():
+                p.requires_grad_(True)
         else:
-            raise ValueError(f"Unknown tuning mode: {tuning}")
+            raise ValueError(f"Unknown tuning mode: {tuning}. Only 'lora' or 'full' are supported.")
 
-        # Only enable gradient checkpointing for trainable models
-        if tuning != 'frozen':
-            self.backbone.gradient_checkpointing_enable()
+        # Enable gradient checkpointing for both tuning modes
+        self.backbone.gradient_checkpointing_enable()
             
         self.hidden_size = self.backbone.config.hidden_size  # 2048 for Qwen2.5-VL-3B
         self.model_name = model_name
@@ -109,6 +107,10 @@ class QwenSemanticsEncoder(nn.Module):
             self.backbone.save_pretrained(path)
 
     def load_lora_weights(self, path):
+        """Load LoRA adapter weights from checkpoint."""
         if self.tuning == 'lora':
-            # Load adapters here as needed
-            pass
+            from peft import PeftModel
+            self.backbone = PeftModel.from_pretrained(self.backbone, path)
+            print(f"Loaded LoRA weights from {path}")
+        else:
+            print(f"Warning: load_lora_weights called but tuning mode is '{self.tuning}'")

@@ -670,7 +670,7 @@ class QwenSemanticsEncoder(nn.Module):
     Semantic encoder using Qwen2.5-VL-3B-Instruct.
     Extracts multimodal features from images and text instructions.
     """
-    def __init__(self, device=None, dtype=torch.float16, tuning='frozen', lora_cfg=None):
+    def __init__(self, device=None, dtype=torch.float16, tuning='lora', lora_cfg=None):
         super().__init__()
         model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
         
@@ -686,7 +686,7 @@ class QwenSemanticsEncoder(nn.Module):
         self.backbone.gradient_checkpointing_enable()
         self.hidden_size = self.backbone.config.hidden_size  # 2048
         
-        # Setup tuning mode (frozen, lora, or full)
+        # Setup tuning mode (lora or full)
         # ... (see models/semantics_qwen.py for full implementation)
     
     def forward(self, images_list, texts_list):

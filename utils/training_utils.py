@@ -144,17 +144,22 @@ def load_checkpoint(
 def compute_contact_metrics(
     logits: torch.Tensor, 
     labels: torch.Tensor,
-    threshold: float = 0.5
+    tau: float = 0.01,
+    contact_threshold: float = 0.01
 ) -> Dict[str, float]:
     """
     Compute comprehensive metrics for contact prediction, including per-class accuracy.
+    
+    Uses distance-based thresholding by inverting the RBF kernel to get predicted distances,
+    then applying the same contact_threshold used for ground truth labels.
     
     Args:
         logits: [B, N, 7] predicted logits from contact head
             Index 0: no_contact
             Index 1-6: palm, thumb, index, middle, ring, pinky
         labels: [B, N] ground truth labels (0-6)
-        threshold: Sigmoid threshold for binary contact prediction (default 0.5)
+        tau: RBF kernel scale parameter (default 0.01 = 10mm)
+        contact_threshold: Distance threshold in meters (default 0.01 = 10mm)
     
     Returns:
         Dict with:
@@ -165,9 +170,20 @@ def compute_contact_metrics(
             - acc_no_contact, acc_palm, acc_thumb, acc_index, acc_middle, acc_ring, acc_pinky: Per-class accuracy
     """
     with torch.no_grad():
-        # Binary contact prediction
+        # Binary contact prediction via RBF inversion
         part_probs = torch.sigmoid(logits[..., 1:])  # [B, N, 6]
-        pred_contact = (part_probs > threshold).any(dim=-1)  # [B, N]
+        
+        # Invert RBF kernel to get predicted distances
+        # Formula: soft_target = exp(-distance/tau)
+        # Inversion: distance = -tau * ln(prob)
+        # Clamp probabilities to prevent ln(0)
+        part_probs_clamped = torch.clamp(part_probs, min=1e-7, max=1.0)
+        predicted_distances = -tau * torch.log(part_probs_clamped)  # [B, N, 6]
+        
+        # Use SAME threshold as ground truth labels
+        pred_contact = (predicted_distances < contact_threshold).any(dim=-1)  # [B, N]
+        # If ANY part has predicted_distance < 0.01m → predict contact
+        
         true_contact = labels > 0  # [B, N]
         
         # Compute confusion matrix elements
@@ -190,13 +206,24 @@ def compute_contact_metrics(
         }
         
         # Per-class accuracy aligned with multi-label modeling
-        # Derive predicted class as: no_contact if no part exceeds threshold; else argmax over parts
+        # Derive predicted class from independent sigmoid probabilities + thresholding
+        # (consistent with BCE training, not softmax which would be mutually exclusive)
+        
+        # Extract contact part probabilities (indices 1-6, skip no_contact at index 0)
         K = logits.shape[-1]
-        part_probs = torch.sigmoid(logits[..., 1:])  # [B, N, 6]
-        has_contact = (part_probs > threshold).any(dim=-1)  # [B, N]
-        # Argmax over parts (1..6), then map to 1..6; if no contact, set 0
-        part_argmax = part_probs.argmax(dim=-1) + 1  # in 1..6
-        preds_mll = torch.where(has_contact, part_argmax, torch.zeros_like(part_argmax))  # 0..6
+        part_probs = torch.sigmoid(logits[..., 1:])  # [B, N, 6] - independent probs for 6 parts
+        
+        # Invert RBF kernel to get predicted distances, use contact_threshold
+        part_probs_clamped = torch.clamp(part_probs, min=1e-7, max=1.0)
+        predicted_distances = -tau * torch.log(part_probs_clamped)  # [B, N, 6]
+        has_contact = (predicted_distances < contact_threshold).any(dim=-1)  # [B, N]
+        
+        # For contact points: predict the part with highest probability
+        # Argmax returns [0-5], add 1 to get [1-6] matching dataset label convention
+        part_argmax = part_probs.argmax(dim=-1) + 1  # [B, N] in range [1-6]
+        
+        # Final prediction: 0 if no contact, else best contact part
+        preds_mll = torch.where(has_contact, part_argmax, torch.zeros_like(part_argmax))  # [B, N] in [0-6]
         
         class_names = ['no_contact', 'palm', 'thumb', 'index', 'middle', 'ring', 'pinky']
         for class_id, class_name in enumerate(class_names):
@@ -216,7 +243,9 @@ def visualize_predictions(
     batch: Dict,
     outputs: Dict,
     save_dir: str,
-    num_samples: int = 3
+    num_samples: int = 3,
+    tau: float = 0.01,
+    contact_threshold: float = 0.01
 ):
     """
     Visualize model predictions in 3D for qualitative evaluation.
@@ -257,9 +286,13 @@ def visualize_predictions(
         shape_pred = predicted_poses[i, 48:58].numpy()
         trans_pred = predicted_poses[i, 58:61].numpy()
         
-        # Predicted contact (from logits)
-        probs_all = torch.softmax(logits_c[i], dim=-1)  # [N, 7]
-        pred_labels = probs_all.argmax(dim=-1).numpy()  # [N] - predicted class
+        # Predicted contact (from logits) - use multi-label logic with distance-based threshold
+        part_probs = torch.sigmoid(logits_c[i, :, 1:])  # [N, 6]
+        part_probs_clamped = torch.clamp(part_probs, min=1e-7, max=1.0)
+        predicted_distances = -tau * torch.log(part_probs_clamped)  # [N, 6]
+        has_contact = (predicted_distances < contact_threshold).any(dim=-1)  # [N]
+        part_argmax = part_probs.argmax(dim=-1) + 1  # [N] in 1..6
+        pred_labels = torch.where(has_contact, part_argmax, torch.zeros_like(part_argmax)).numpy()  # [N]
         
         # Create contact info dict for predicted contacts
         contact_info_pred = {

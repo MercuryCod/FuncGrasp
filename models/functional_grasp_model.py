@@ -1,6 +1,8 @@
 # functional_grasp_model.py (corrected)
+import numpy as np
 import torch
 import torch.nn as nn
+from typing import Optional
 
 from .semantics_qwen import QwenSemanticsEncoder
 from .pointnet2_encoder import PN2GeometryEncoder
@@ -20,16 +22,15 @@ class FunctionalGraspModel(nn.Module):
         self,
         CSEM: int = 256,
         CGEO: int = 256,
-        DPOSE: int = 63,
+        DPOSE: int = 61,
         K_CONTACT: int = 7,
-        qwen_tuning: str = 'frozen',
+        qwen_tuning: str = 'lora',
         lora_cfg: dict = None,
-        contact_regression: bool = True,
-        inference_threshold: float = 0.4
+        contact_regression: bool = True
     ):
         super().__init__()
 
-        self.sem = QwenSemanticsEncoder(tuning=qwen_tuning, lora_cfg=lora_cfg, dtype=torch.bfloat16)
+        self.sem = QwenSemanticsEncoder(tuning=qwen_tuning, lora_cfg=lora_cfg)
         dq = int(getattr(self.sem, 'hidden_size', 0) or 0)
         if dq <= 0:
             raise ValueError("QwenSemanticsEncoder.hidden_size must be > 0")
@@ -46,14 +47,13 @@ class FunctionalGraspModel(nn.Module):
 
         self.cm = ContactHead(c_fuse=CFUSE, k=K_CONTACT)
         if getattr(self.cm.net[-1], 'out_features', None) != 7:
-            raise ValueError("ContactHead must output 7 classes (thumb,index,middle,ring,little,palm,no_contact)")
+            raise ValueError("ContactHead must output 7 classes (no_contact, palm, thumb, index, middle, ring, pinky)")
 
         self.flow = PoseFlow(d_pose=DPOSE, c_cond=CFUSE)
 
         self.DPOSE = DPOSE
         self.K_CONTACT = K_CONTACT
         self.contact_regression = contact_regression
-        self.inference_threshold = inference_threshold
 
     def _model_device(self):
         return next(self.parameters()).device
@@ -87,19 +87,23 @@ class FunctionalGraspModel(nn.Module):
         # Contact prediction
         logits_c = self.cm(f_fuse)                            # [B, N, 7]
 
-        # Pooling weights
+        # Contact-weighted pooling for flow conditioning
+        # DESIGN: Use predicted contact probabilities to weight pooling
+        # CRITICAL: Detach to prevent gradient flow from flow loss to contact head
         if self.contact_regression:
             # Use independent sigmoid over the 6 contact parts (exclude no_contact at index 0)
             # Indices 1-6: palm, thumb, index, middle, ring, pinky
             part_probs = torch.sigmoid(logits_c[..., 1:])     # [B, N, 6]
             w = part_probs.max(dim=-1)[0]                     # [B, N]
+            w = w.detach()  # ✓ CRITICAL: Stop gradient flow from flow loss
         else:
             probs = logits_c.softmax(dim=-1)                  # [B, N, 7]
             no_contact_index = int(getattr(Config, "NO_CONTACT_INDEX", 0))  # Default to 0
             p_nc = probs[..., no_contact_index]               # [B, N]
-            w = 1.0 - p_nc
+            w = (1.0 - p_nc).detach()  # ✓ Detach here too
 
         # Normalize and pool
+        # This creates contact-weighted conditioning for flow network
         w = w / (w.sum(dim=1, keepdim=True) + 1e-6)
         c = (w.unsqueeze(-1) * f_fuse).sum(dim=1)             # [B, CFUSE]
 
@@ -115,16 +119,29 @@ class FunctionalGraspModel(nn.Module):
     def sample(self, images_list, texts_list, pts, num_steps=20):
         """
         Sample grasp poses with rectified-flow Euler integration.
+        
+        The flow network is trained directly in MANO parameter space (unnormalized).
+        This allows the model to generalize to any MANO parameters without
+        dataset-specific bias from normalization statistics.
+        
+        Returns:
+            x: [B, DPOSE] MANO parameters (ready for MANO forward kinematics)
         """
         self.eval()
         device = self._model_device()
         with torch.no_grad():
             _, _, c = self.forward_backbone(images_list, texts_list, pts)   # c on model device
             B = c.size(0)
+            
+            # Sample from noise (standard Gaussian)
             x = torch.randn(B, self.DPOSE, device=device)
             dt = 1.0 / num_steps
+            
+            # Euler integration
             for k in range(num_steps):
                 t = torch.full((B,), (k + 0.5) / num_steps, device=device)
                 v = self.flow_step(x, t, c)
                 x = x + dt * v
+            
+            # Return directly (no denormalization needed - trained in original space)
             return x
