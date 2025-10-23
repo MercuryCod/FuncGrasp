@@ -56,10 +56,10 @@ Input: Object Point Cloud (N×3) + Multi-view Images (6×H×W×3) + Text Instruc
         ┌───────────────────────────┴───────────────────────────┐
         ↓                                                       ↓
 Geometric Encoder                                    Semantic Encoder
-(PointNet++)                                         (Qwen2.5-VL-3B + Projection)
+(PointNet++)                                         (Qwen3-VL-4B + Projection)
     [B, N, 3]                                        [6 images + text]
         ↓                                                       ↓
-[B, N, CGEO=256]                                         [B, CSEM=256]
+[B, N, CGEO=512]                                        [B, CSEM=512]
         ↓                                                       ↓
         └───────────────────────────┬───────────────────────────┘
                                     ↓
@@ -88,8 +88,8 @@ Geometric Encoder                                    Semantic Encoder
 **Architecture**: Single-Scale Grouping (SSG)
 ```python
 Input: pts [B, N, 3]
-↓ SA-1: FPS sample 512 points, radius 0.2, MLP [3+3 → 64 → 64 → 128 → 256]
-↓ SA-2: FPS sample 128 points, radius 0.4, MLP [256+3 → 128 → 128 → 256 → 256]
+↓ SA-1: FPS sample 512 points, radius 0.003m (3mm), MLP [3+3 → 64 → 64 → 128 → 256]
+↓ SA-2: FPS sample 128 points, radius 0.006m (6mm), MLP [256+3 → 128 → 128 → 256 → 256]
 ↓ Global: MaxPool + MLP [256 → 512 → 256]
 ↓ FP-1: Interpolate + MLP [256+256 → 256 → 256]
 ↓ FP-0: Interpolate + MLP [256+3 → 256 → 256]
@@ -104,16 +104,40 @@ Output: f_geo [B, N, 256], g [B, 256]
 
 **File**: `models/pointnet2_encoder.py`
 
-### 2. Semantic Encoder (Qwen2.5-VL-3B)
+**Hyperparameters** (centralized in `config.py::Config.GEO`):
+
+| Parameter | Default | Unit | Description |
+|-----------|---------|------|-------------|
+| `encoder_type` | ssg | - | Single-Scale or Multi-Scale Grouping |
+| `in_channels` | 3 | - | Input feature dim (3 for xyz only) |
+| `n_samples_sa1` | 512 | points | FPS samples for SA-1 layer |
+| `n_samples_sa2` | 128 | points | FPS samples for SA-2 layer |
+| `radius_sa1` | 0.003 | meters | Neighborhood radius SA-1 (3mm) |
+| `radius_sa2` | 0.006 | meters | Neighborhood radius SA-2 (6mm) |
+| `max_neighbors_sa1` | 32 | points | Memory cap per SA-1 center |
+| `max_neighbors_sa2` | 64 | points | Memory cap per SA-2 center |
+| `k_interpolate` | 5 | points | kNN for feature propagation |
+
+**Note**: Output channels are set by `MODEL['CGEO']` (single source of truth).
+
+**Tuning Guidelines**:
+- **Radii**: Current defaults (3mm, 6mm) capture fine-grained contact geometry. Typical OakInk objects span 0.1–0.3m; consider 10-20mm / 20-40mm for broader context.
+- **Hierarchy**: Ensure r2 >= r1 for proper receptive field growth
+- **Sampling**: n1 < n_points, n2 < n1 for hierarchical downsampling
+- **Memory**: Reduce max_neighbors if OOM; increase if neighborhoods are sparse
+- **Units**: All spatial parameters in meters (objects/hands are in meters)
+- **Contact-aware tuning**: For contact prediction (threshold=10mm), set r2 ≥ contact_threshold for full neighborhood visibility
+
+### 2. Semantic Encoder (Qwen3-VL-4B)
 
 **Architecture**: Vision-Language Transformer
 ```python
 Input: [6 images (PIL) + text instruction]
 ↓ Processor: Apply chat template, tokenize, process images
-↓ Qwen2.5-VL: Extract encoder hidden states [B, L, 2048]
-↓ Pooling: Attention-masked mean pooling → [B, 2048]
-↓ Projection: LayerNorm + Linear → [B, 256]
-Output: s [B, 256]
+↓ Qwen3-VL: Extract encoder hidden states [B, L, 2560]
+↓ Pooling: Attention-masked mean pooling → [B, 2560]
+↓ Projection: LayerNorm + Linear → [B, 512]
+Output: s [B, 512]
 ```
 
 **Tuning Modes**:
@@ -746,7 +770,7 @@ FuncGrasp/
 ├── models/
 │   ├── functional_grasp_model.py    # Main model (integrates all components)
 │   ├── pointnet2_encoder.py         # Geometric encoder (PointNet++)
-│   ├── semantics_qwen.py            # Semantic encoder (Qwen2.5-VL)
+│   ├── semantics_qwen.py            # Semantic encoder (Qwen3-VL)
 │   ├── fusion_transformer.py        # Multi-modal fusion
 │   ├── contact_head.py              # Contact prediction head
 │   └── flow_matching.py             # Flow matching network
@@ -770,10 +794,10 @@ FuncGrasp/
 
 | Component | Memory | Trainable Params |
 |-----------|--------|------------------|
-| Qwen2.5-VL (frozen) | ~7 GB | 0 |
-| Qwen2.5-VL (LoRA) | ~8 GB | 90M |
+| Qwen3-VL-4B (frozen) | ~9 GB | 0 |
+| Qwen3-VL-4B (LoRA) | ~10 GB | ~120M |
 | PointNet++ | ~1 GB | 2M |
-| Fusion Transformer | ~0.5 GB | 4M |
+| Fusion Transformer | ~1 GB | ~8M (d=1024) |
 | Contact Head | ~0.1 GB | 0.1M |
 | Flow Network | ~0.1 GB | 66M |
 | **Total (LoRA)** | **~17 GB** | **~162M** |
@@ -1105,7 +1129,7 @@ Now metrics correctly reflect the multi-label training objective and use princip
 ### Papers
 - **PointNet++**: Qi et al., "PointNet++: Deep Hierarchical Feature Learning on Point Sets in a Metric Space", NeurIPS 2017
 - **Rectified Flow**: Liu et al., "Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow", ICLR 2023
-- **Qwen2.5-VL**: Qwen Team, "Qwen2.5-VL: Multimodal Foundation Models", 2024
+- **Qwen3-VL**: Qwen Team, "Qwen3-VL: Enhanced Multimodal Foundation Models", 2025
 
 ### Datasets
 - **OakInk**: Yang et al., "OakInk: A Large-scale Knowledge Repository for Understanding Hand-Object Interaction", CVPR 2022
@@ -1113,7 +1137,7 @@ Now metrics correctly reflect the multi-label training objective and use princip
 
 ### Code References
 - PyTorch Geometric: https://pytorch-geometric.readthedocs.io/
-- Transformers (Qwen): https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct
+- Transformers (Qwen): https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct
 - manotorch: https://github.com/lixiny/manotorch
 
 ---

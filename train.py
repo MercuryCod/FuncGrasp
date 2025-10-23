@@ -55,6 +55,7 @@ def train_epoch(
     flow_criterion: FlowMatchingLoss,
     val_loader: DataLoader,
     test_loader: DataLoader,
+    train_loader_for_vis: DataLoader,
     config: dict,
     epoch: int,
     device: torch.device,
@@ -102,35 +103,42 @@ def train_epoch(
         images_list = batch['images_list']  # List of PIL images
         texts_list = batch['texts_list']    # List of strings
 
-        # Forward pass: contact prediction + semantic/geometric encoding
-        outputs = model.forward_train(images_list, texts_list, pts)
-
-        # Sample flow matching pairs
-        # Rectified flow: learn v(x_t, t, c) where x_t = (1-t)*x_0 + t*x_1
-        B = pts.shape[0]
-        t = torch.rand(B, device=device)  # Random timestep in [0, 1]
-        x0 = torch.randn_like(mano_params)  # Noise (source distribution)
-        x1 = mano_params  # Target pose (data distribution)
-        x_t = (1 - t[:, None]) * x0 + t[:, None] * x1  # Linear interpolation
-        target_velocity = x1 - x0  # Constant velocity along straight path
-
-        # Forward pass: flow matching network
-        model_velocity = model.flow_step(x_t, t, outputs['cond'])
-        outputs['model_velocity'] = model_velocity
+        # Forward pass: contact prediction + flow matching (if active)
+        # The model handles whether to compute flow based on training_mode and training_stage
+        outputs = model.forward_train(images_list, texts_list, pts, mano_params_gt=mano_params)
+        
+        # For backward compatibility with compute_total_loss, add target_velocity if flow was computed
+        if 'v_pred' in outputs and 'v_gt' in outputs:
+            outputs['model_velocity'] = outputs['v_pred']
+            # Create dummy target_velocity for loss computation interface (not used with new outputs)
+            target_velocity = outputs['v_gt']
+        else:
+            # No flow computed (stage 1 of staged training)
+            target_velocity = None
 
         # Compute losses (use soft targets for training)
-        losses = compute_total_loss(
-            outputs,
-            {
-                'contact_soft_targets': contact_soft_targets,  # Soft probability distributions
-                'target_velocity': target_velocity,
-                't': t
-            },
-            contact_criterion,
-            flow_criterion,
-            lambda_contact=config['training']['lambda_contact'],
-            lambda_flow=config['training']['lambda_flow']
-        )
+        if target_velocity is not None:
+            # Flow is active: compute both losses
+            losses = compute_total_loss(
+                outputs,
+                {
+                    'contact_soft_targets': contact_soft_targets,
+                    'target_velocity': target_velocity,
+                    't': None  # Not used with v_pred/v_gt approach
+                },
+                contact_criterion,
+                flow_criterion,
+                lambda_contact=config['training']['lambda_contact'],
+                lambda_flow=config['training']['lambda_flow']
+            )
+        else:
+            # Flow not active (stage 1): only contact loss
+            contact_loss = contact_criterion(outputs['logits_c'], contact_soft_targets)
+            losses = {
+                'total': contact_loss,
+                'contact': contact_loss,
+                'flow': torch.tensor(0.0, device=device)
+            }
 
         # Backward pass
         optimizer.zero_grad()
@@ -186,7 +194,7 @@ def train_epoch(
             logging.info("%s", "="*80)
             val_metrics = validate(
                 model, val_loader, contact_criterion,
-                config, device, epoch, global_step, test_loader
+                config, device, epoch, global_step, test_loader, train_loader_for_vis
             )
             logging.info(
                 "Val - Total: %.4f (C: %.4f, F: %.4f), Acc: %.3f, F1: %.3f",
@@ -207,6 +215,7 @@ def train_epoch(
             if val_metrics['total_loss'] < best_val_total:
                 best_val_total = val_metrics['total_loss']
                 logging.info("  🎉 New best Total Loss: %.4f", best_val_total)
+                # Save scheduler state (None if disabled)
                 save_checkpoint(
                     model, optimizer, scheduler, epoch, val_metrics,
                     os.path.join(config['paths']['checkpoint_dir'], 'best.pth'),
@@ -245,7 +254,8 @@ def validate(
     device: torch.device,
     epoch: int,
     global_step: int = 0,
-    test_loader: DataLoader = None
+    test_loader: DataLoader = None,
+    train_loader: DataLoader = None
 ) -> dict:
     """
     Validate model on validation set.
@@ -307,7 +317,13 @@ def validate(
         # Flow matching loss computation
         B = pts.shape[0]
         t = torch.rand(B, device=device)  # Random timestep
-        x0 = torch.randn_like(mano_params)  # Noise
+        
+        # Sample noise with parameter-specific scaling
+        x0 = torch.randn_like(mano_params)  # Base noise N(0, 1)
+        x0[:, :48] *= config['flow']['noise_scale_pose']    # Pose
+        x0[:, 48:58] *= config['flow']['noise_scale_shape']  # Shape
+        x0[:, 58:61] *= config['flow']['noise_scale_trans']  # Translation
+        
         x1 = mano_params  # Target pose
         x_t = (1 - t[:, None]) * x0 + t[:, None] * x1
         target_velocity = x1 - x0
@@ -338,60 +354,60 @@ def validate(
     for k in val_metrics:
         val_metrics[k] /= len(dataloader)
 
-    # Qualitative visualization on test set (random samples)
-    if test_loader is not None:
-        # Prefer validation set for qualitative unless explicitly configured to use test
-        qual_source = config['eval'].get('qual_source', 'val')  # 'val' or 'test'
-        if qual_source == 'test':
-            logging.info("\n  Generating qualitative visualizations on test set...")
-            qual_loader = test_loader
-        else:
-            logging.info("\n  Generating qualitative visualizations on validation set...")
-            qual_loader = dataloader
-
-        # Randomly select samples from chosen set
-        num_qual = config['eval']['num_qualitative']
-        qual_dataset = qual_loader.dataset
-        total_qual = len(qual_dataset)
-
-        # Random indices
-        random_indices = random.sample(range(total_qual), min(num_qual, total_qual))
-
-        # Manually fetch samples (to avoid batch collation issues)
-        test_samples = [qual_dataset[i] for i in random_indices]
-
-        # Collate into a batch
-        collate_fn = qual_loader.collate_fn
-        test_batch = collate_fn(test_samples)
-
-        # Move to device
-        pts = test_batch['pts'].to(device)
-        images_list = test_batch['images_list']
-        texts_list = test_batch['texts_list']
-
-        # Forward pass for contact prediction
-        outputs = model.forward_train(images_list, texts_list, pts)
-
-        # Generate predicted grasp poses using flow matching
-        logging.info("  Sampling grasp poses using flow matching...")
+    # Qualitative visualizations from train, val, and test sets
+    logging.info("\n  Generating qualitative visualizations...")
+    num_qual = config['eval']['num_qualitative']
+    base_save_dir = os.path.join(config['paths']['qual_dir'], f'step_{global_step:06d}')
+    collate_fn = dataloader.collate_fn
+    
+    # Re-seed based on global_step for different samples each validation
+    # This ensures:
+    # 1. Different samples selected at each validation step
+    # 2. Reproducible if you re-run (same step = same samples)
+    random.seed(42 + global_step)
+    
+    # Helper function to visualize a set of samples
+    def visualize_split(split_name, split_loader):
+        if split_loader is None:
+            return
+        
+        logging.info(f"    - {split_name} set: sampling {num_qual} random examples")
+        split_dataset = split_loader.dataset
+        total_samples = len(split_dataset)
+        indices = random.sample(range(total_samples), min(num_qual, total_samples))
+        samples = [split_dataset[i] for i in indices]
+        
+        # Collate
+        batch = collate_fn(samples)
+        
+        # Forward pass
+        pts = batch['pts'].to(device)
+        outputs = model.forward_train(batch['images_list'], batch['texts_list'], pts)
+        
+        # Generate poses
         predicted_poses = model.sample(
-            images_list, texts_list, pts,
+            batch['images_list'], batch['texts_list'], pts,
             num_steps=config['flow']['num_steps_inference']
-        )  # [B, 61]
+        )
         outputs['predicted_poses'] = predicted_poses
-
-        # Visualize (uses hard_labels from batch for GT visualization)
-        # Include global_step in directory name to differentiate step-based validations
-        save_dir = os.path.join(config['paths']['qual_dir'], f'step_{global_step:06d}')
+        
+        # Save to split-specific subdirectory
+        save_dir = os.path.join(base_save_dir, split_name.lower())
         visualize_predictions(
-            test_batch,
-            outputs,
-            save_dir,
+            batch, outputs, save_dir,
             num_samples=num_qual,
             tau=config['data']['soft_target_tau'],
             contact_threshold=config['data']['contact_threshold']
         )
-
+    
+    # Visualize from all three splits
+    visualize_split('Train', train_loader)
+    visualize_split('Val', dataloader)
+    visualize_split('Test', test_loader)
+    
+    # Restore global random seed for training reproducibility
+    random.seed(42)
+    
     model.train()
     return val_metrics
 
@@ -472,7 +488,7 @@ def main():
         contact_threshold=config['data']['contact_threshold'],
         load_object_images=True,
         rendered_dir=config['data']['render_dir'],
-        filter_zero_contact=config['data'].get('filter_zero_contact', False)
+        filter_zero_contact=config['data'].get('filter_zero_contact', True)
     )
     logging.info("Train samples: %d", len(train_dataset))
 
@@ -487,7 +503,7 @@ def main():
         load_object_images=True,
         rendered_dir=config['data']['render_dir'],
         # Evaluation should include zero-contact approach poses for fair metrics
-        filter_zero_contact=False
+        filter_zero_contact=True
     )
 
     # Limit validation samples in debug mode for faster validation
@@ -513,7 +529,7 @@ def main():
         contact_threshold=config['data']['contact_threshold'],
         load_object_images=True,
         rendered_dir=config['data']['render_dir'],
-        filter_zero_contact=False  # Keep all test samples for comprehensive evaluation
+        filter_zero_contact=True  
     )
     logging.info("Test samples: %d", len(test_dataset))
 
@@ -568,7 +584,9 @@ def main():
         K_CONTACT=config['model']['K_CONTACT'],
         qwen_tuning=config['model']['qwen_tuning'],
         lora_cfg=config['lora'],
-        contact_regression=config['model']['contact_regression']
+        geo_cfg=config['geo'],
+        flow_cfg=config['flow'],
+        training_mode=config['training']['training_mode']
     ).to(device)
 
     # Count parameters
@@ -577,6 +595,29 @@ def main():
     logging.info("Total parameters: %s", f"{total_params:,}")
     logging.info("Trainable parameters: %s (%.2f%%)",
                  f"{trainable_params:,}", 100*trainable_params/total_params)
+    
+    # Log PointNet++ configuration
+    logging.info("\nPointNet++ Geometric Encoder:")
+    logging.info("  Encoder type: %s", config['geo']['encoder_type'].upper())
+    logging.info("  Output channels: %d (CGEO)", config['model']['CGEO'])
+    logging.info("  SA-1: n_samples=%d, radius=%.3fm (%.0fmm), max_neighbors=%d",
+                 config['geo']['n_samples_sa1'],
+                 config['geo']['radius_sa1'],
+                 config['geo']['radius_sa1'] * 1000,
+                 config['geo']['max_neighbors_sa1'])
+    logging.info("  SA-2: n_samples=%d, radius=%.3fm (%.0fmm), max_neighbors=%d",
+                 config['geo']['n_samples_sa2'],
+                 config['geo']['radius_sa2'],
+                 config['geo']['radius_sa2'] * 1000,
+                 config['geo']['max_neighbors_sa2'])
+    logging.info("  Feature propagation: k=%d", config['geo']['k_interpolate'])
+    
+    logging.info("\nFlow Matching Configuration:")
+    logging.info("  Inference steps: %d", config['flow']['num_steps_inference'])
+    logging.info("  Noise scales: pose=%.1f, shape=%.1f, trans=%.1f",
+                 config['flow']['noise_scale_pose'],
+                 config['flow']['noise_scale_shape'],
+                 config['flow']['noise_scale_trans'])
 
     # =================================================================
     # Optimization Setup
@@ -603,7 +644,7 @@ def main():
                  config['training']['learning_rate'], config['training']['weight_decay'])
 
     # Learning rate scheduler with warmup
-    warmup_epochs = config['training'].get('warmup_epochs', 3)
+    warmup_epochs = config['training'].get('warmup_epochs', 1)
     warmup_scheduler = LinearLR(
         optimizer,
         start_factor=0.1,  # Start at 10% of base LR
@@ -620,14 +661,15 @@ def main():
         schedulers=[warmup_scheduler, cosine_scheduler],
         milestones=[warmup_epochs]
     )
-    logging.info("Scheduler: Warmup (%d epochs) + CosineAnnealing (T_max=%d, eta_min=1e-6)",
+    logging.info("Scheduler: Warmup (%d epoch) + CosineAnnealing (T_max=%d, eta_min=1e-6)",
                  warmup_epochs, config['training']['epochs'] - warmup_epochs)
 
     # =================================================================
     # Training Loop
     # =================================================================
+    training_mode = config['training']['training_mode']
     logging.info("\n%s", "="*80)
-    logging.info("STARTING TRAINING")
+    logging.info("STARTING TRAINING (Mode: %s)", training_mode.upper())
     logging.info("%s", "="*80)
     logging.info("Epochs: %d", config['training']['epochs'])
     logging.info("Batch size: %d", config['training']['batch_size'])
@@ -635,37 +677,169 @@ def main():
 
     best_val_total = float('inf')
     global_step = 0
-
-    for epoch in range(config['training']['epochs']):
+    
+    # ============================================================
+    # STAGED TRAINING: Separate contact-only and joint phases
+    # ============================================================
+    if training_mode == 'staged':
+        staged_cfg = config['training']['staged']
+        
+        # ======================= STAGE 1: Contact Only =======================
         logging.info("\n%s", "="*80)
-        logging.info("Epoch %d/%d", epoch+1, config['training']['epochs'])
+        logging.info("STAGE 1: CONTACT PREDICTION ONLY")
+        logging.info("Epochs: %d", staged_cfg['stage1_epochs'])
         logging.info("%s", "="*80)
-
-        # Train (includes step-based validation)
-        train_metrics, global_step, best_val_total = train_epoch(
-            model, train_loader, optimizer, scheduler,
-            contact_criterion, flow_criterion,
-            val_loader, test_loader,
-            config, epoch, device, global_step, best_val_total
+        
+        model.set_training_stage('stage1')
+        
+        for epoch in range(staged_cfg['stage1_epochs']):
+            logging.info("\n%s", "-"*80)
+            logging.info("Stage 1 - Epoch %d/%d", epoch+1, staged_cfg['stage1_epochs'])
+            logging.info("%s", "-"*80)
+            
+            train_metrics, global_step, best_val_total = train_epoch(
+                model, train_loader, optimizer, scheduler,
+                contact_criterion, flow_criterion,
+                val_loader, test_loader, train_loader, config,
+                epoch, device, global_step, best_val_total
+            )
+            
+            # Log epoch summary
+            current_lr = scheduler.get_last_lr()[0]
+            logging.info("\nStage 1 - Epoch %d Summary:", epoch+1)
+            logging.info("  Contact Loss: %.4f, Acc: %.3f",
+                        train_metrics['contact_loss'], train_metrics['contact_accuracy'])
+            logging.info("  Learning rate: %.6f", current_lr)
+            
+            scheduler.step()
+        
+        # Save stage 1 checkpoint
+        if staged_cfg.get('save_stage1_checkpoint', True):
+            stage1_ckpt = os.path.join(config['paths']['checkpoint_dir'], 'stage1_final.pth')
+            save_checkpoint(model, optimizer, scheduler, epoch, train_metrics, stage1_ckpt)
+            logging.info("\n✅ Stage 1 checkpoint saved: %s", stage1_ckpt)
+        
+        # ======================= STAGE 2: Joint Training =======================
+        logging.info("\n%s", "="*80)
+        logging.info("STAGE 2: JOINT CONTACT + FLOW MATCHING")
+        logging.info("Epochs: %d", staged_cfg['stage2_epochs'])
+        logging.info("Contact LR scale: %.2f", staged_cfg['stage2_contact_lr_scale'])
+        logging.info("Flow LR: %.2e", staged_cfg['stage2_flow_lr'])
+        logging.info("%s", "="*80)
+        
+        model.set_training_stage('stage2')
+        
+        # Create new optimizer for stage 2 with different LRs
+        contact_lr_scale = staged_cfg['stage2_contact_lr_scale']
+        base_lr = config['training']['learning_rate']
+        
+        if contact_lr_scale == 0:
+            # Freeze contact pathway completely
+            logging.info("Freezing contact pathway (LR scale = 0)")
+            for p in model.sem.parameters():
+                p.requires_grad_(False)
+            for p in model.pc.parameters():
+                p.requires_grad_(False)
+            for p in model.fuse.parameters():
+                p.requires_grad_(False)
+            for p in model.cm.parameters():
+                p.requires_grad_(False)
+            
+            optimizer = AdamW(
+                [{'params': model.flow.parameters(), 'lr': staged_cfg['stage2_flow_lr']}],
+                weight_decay=config['training']['weight_decay']
+            )
+        else:
+            # Reduce contact pathway LR
+            logging.info("Reducing contact pathway LR by %.2fx", contact_lr_scale)
+            optimizer = AdamW([
+                {'params': model.sem.parameters(), 'lr': base_lr * contact_lr_scale},
+                {'params': model.sem_proj.parameters(), 'lr': base_lr * contact_lr_scale},
+                {'params': model.pc.parameters(), 'lr': base_lr * contact_lr_scale},
+                {'params': model.fuse.parameters(), 'lr': base_lr * contact_lr_scale},
+                {'params': model.cm.parameters(), 'lr': base_lr * contact_lr_scale},
+                {'params': model.flow.parameters(), 'lr': staged_cfg['stage2_flow_lr']},
+            ], weight_decay=config['training']['weight_decay'])
+        
+        # New scheduler for stage 2
+        warmup_scheduler = LinearLR(
+            optimizer,
+            start_factor=0.1,
+            total_iters=config['training']['warmup_epochs']
         )
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=staged_cfg['stage2_epochs'],
+            eta_min=1e-6
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[config['training']['warmup_epochs']]
+        )
+        
+        # Train stage 2
+        for epoch in range(staged_cfg['stage2_epochs']):
+            logging.info("\n%s", "-"*80)
+            logging.info("Stage 2 - Epoch %d/%d", epoch+1, staged_cfg['stage2_epochs'])
+            logging.info("%s", "-"*80)
+            
+            train_metrics, global_step, best_val_total = train_epoch(
+                model, train_loader, optimizer, scheduler,
+                contact_criterion, flow_criterion,
+                val_loader, test_loader, train_loader, config,
+                epoch, device, global_step, best_val_total
+            )
+            
+            # Log epoch summary
+            current_lr = scheduler.get_last_lr()[0]
+            logging.info("\nStage 2 - Epoch %d Summary:", epoch+1)
+            logging.info("  Train - Loss: %.4f, Contact: %.4f, Flow: %.4f, Acc: %.3f",
+                        train_metrics['loss'], train_metrics['contact_loss'],
+                        train_metrics['flow_loss'], train_metrics['contact_accuracy'])
+            logging.info("  Learning rate: %.6f", current_lr)
+            
+            scheduler.step()
+        
+        logging.info("\n✅ Staged training complete (Stage 1 + Stage 2)")
+        
+    # ============================================================
+    # JOINT TRAINING: Train contact + flow together from start
+    # ============================================================
+    else:  # training_mode == 'joint'
+        logging.info("Training mode: JOINT (contact + flow from epoch 0)")
+        logging.info("Note: Using .detach() in contact-weighted pooling to prevent gradient contamination")
+        
+        for epoch in range(config['training']['epochs']):
+            logging.info("\n%s", "="*80)
+            logging.info("Epoch %d/%d", epoch+1, config['training']['epochs'])
+            logging.info("%s", "="*80)
 
-        # Log epoch summary with current LR
-        current_lr = scheduler.get_last_lr()[0]
-        logging.info("\nEpoch %d Summary:", epoch+1)
-        logging.info("  Train - Loss: %.4f, Contact: %.4f, Flow: %.4f, Acc: %.3f",
-                    train_metrics['loss'], train_metrics['contact_loss'],
-                    train_metrics['flow_loss'], train_metrics['contact_accuracy'])
-        logging.info("  Learning rate: %.6f", current_lr)
-
-        # Save periodic checkpoints
-        if (epoch + 1) % config['training']['checkpoint_interval'] == 0:
-            save_checkpoint(
-                model, optimizer, scheduler, epoch, train_metrics,
-                os.path.join(config['paths']['checkpoint_dir'], f'epoch_{epoch+1:03d}.pth')
+            # Train (includes step-based validation)
+            train_metrics, global_step, best_val_total = train_epoch(
+                model, train_loader, optimizer, scheduler,
+                contact_criterion, flow_criterion,
+                val_loader, test_loader, train_loader,
+                config, epoch, device, global_step, best_val_total
             )
 
-        # Step scheduler (warmup + cosine annealing)
-        scheduler.step()
+            # Log epoch summary with current LR
+            current_lr = scheduler.get_last_lr()[0]
+            logging.info("\nEpoch %d Summary:", epoch+1)
+            logging.info("  Train - Loss: %.4f, Contact: %.4f, Flow: %.4f, Acc: %.3f",
+                        train_metrics['loss'], train_metrics['contact_loss'],
+                        train_metrics['flow_loss'], train_metrics['contact_accuracy'])
+            logging.info("  Learning rate: %.6f", current_lr)
+
+            # Save periodic checkpoints
+            if (epoch + 1) % config['training']['checkpoint_interval'] == 0:
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, train_metrics,
+                    os.path.join(config['paths']['checkpoint_dir'], f'epoch_{epoch+1:03d}.pth')
+                )
+
+            # Step scheduler (warmup + cosine annealing)
+            scheduler.step()
 
     # =================================================================
     # Training Complete

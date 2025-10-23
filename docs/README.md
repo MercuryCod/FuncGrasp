@@ -56,20 +56,33 @@ pip install -e .
 - Invalid soft targets
 - **NaN losses during training**
 
-### 3. Pre-render Object Images (Optional)
+### 3. Pre-render Pose-Aligned Multi-View Images
 
-For training models that use object images, pre-render all 85 unique objects once:
+**Required for training** - Generate grasp-centric multi-view images (~100K grasp instances):
 
 ```bash
 cd /workspace/FuncGrasp
-bash prepare/prepare_renders.sh
+bash prepare/prepare_pose_aligned_renders.sh
 ```
 
 This will:
-- Render all objects from 6 viewpoints (front, back, left, right, top, bottom)
-- Save to `/workspace/data/OakInk/rendered_objects/`
-- Take ~2 minutes
-- Use ~20MB disk space
+- Render **pose-aligned views** where "front" = hand's approach direction
+- Process ~100,000 grasp instances (train + val + test)
+- Save to `/workspace/data/OakInk/rendered_objects_pose_aligned/`
+- Take **14-28 hours** with 8 workers (7-14 hours with 16 workers)
+- Use **~300GB** disk space
+
+**Parallelization**: Adjust workers based on CPU cores:
+```bash
+NUM_WORKERS=16 bash prepare/prepare_pose_aligned_renders.sh
+```
+
+**Monitoring**: Track progress in another terminal:
+```bash
+watch -n 10 'cat /workspace/data/OakInk/rendered_objects_pose_aligned/render_summary.json'
+```
+
+**For details**, see [OakInk Dataset Documentation - Pose-Aligned Rendering](OAKINK_DATASET_DOCUMENTATION.md#12-pose-aligned-multi-view-rendering)
 
 
 
@@ -106,7 +119,7 @@ DATA = {
 ## Model Architecture
 
 **Functional Grasp Prediction**: Multi-modal grasp synthesis with contact-aware flow matching
-- **Vision-Language Model**: Qwen2.5-VL-3B with **bfloat16** for numerical stability (LoRA fine-tuning)
+- **Vision-Language Model**: Qwen3-VL-4B with **bfloat16** for numerical stability (LoRA fine-tuning)
 - **Geometric Encoder**: PointNet++ for object point clouds
 - **Grasp Generation**: Rectified flow for MANO pose synthesis
 - **Contact Prediction**: 7-class finger-specific labels with soft targets
@@ -128,10 +141,9 @@ The Qwen model uses `torch.bfloat16` instead of `float16` for better numerical s
 Core documents:
 - **This file (README.md)**: Quick start, setup, and v2.0 status
 - **[PIPELINE_DESIGN.md](PIPELINE_DESIGN.md)**: Complete architecture, v2.0 changes, soft targets, flow matching, and training loop
-- **[CHANGELOG.md](../CHANGELOG.md)**: Version history and migration guide
-- **[OAKINK_DATASET_DOCUMENTATION.md](OAKINK_DATASET_DOCUMENTATION.md)**: Dataset structure and implementation status
+- **[OAKINK_DATASET_DOCUMENTATION.md](OAKINK_DATASET_DOCUMENTATION.md)**: Dataset structure, pose-aligned rendering, and implementation
 - **[MANO_HAND_MODEL.md](MANO_HAND_MODEL.md)**: Hand model, FK, contact computation, and rendering
-- **[QWEN25VL_DOCUMENTATION.md](QWEN25VL_DOCUMENTATION.md)**: Qwen2.5-VL model architecture, API, and integration
+- **[QWEN3VL_DOCUMENTATION.md](QWEN3VL_DOCUMENTATION.md)**: Qwen3-VL model architecture, API, and integration
 
 ---
 
@@ -146,11 +158,10 @@ Core documents:
 ### Document Structure
 - **README.md** (this file): Quick start, training, and navigation
 - **PIPELINE_DESIGN.md**: Architecture, soft targets, losses, training loop, and debugging
-- **OAKINK_DATASET_DOCUMENTATION.md**: Dataset structure and conventions
+- **OAKINK_DATASET_DOCUMENTATION.md**: Dataset structure, pose-aligned rendering, and conventions
 - **MANO_HAND_MODEL.md**: MANO model, FK, and rendering
-- **QWEN25VL_DOCUMENTATION.md**: Qwen2.5-VL model architecture and API
-- **DOCUMENTATION_INDEX.md**: Navigation hub with quick link
-s
+- **QWEN3VL_DOCUMENTATION.md**: Qwen3-VL model architecture and API
+- **DOCUMENTATION_INDEX.md**: Navigation hub with quick links
 
 ### When to Create New Docs
 - ✅ New dataset integration (create `<DATASET>_DOCUMENTATION.md`)
